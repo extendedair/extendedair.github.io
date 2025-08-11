@@ -1,19 +1,242 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-img {
-  display: block;
-  margin-left: auto;
-  margin-right: auto;
-  margin-top: 20%;
-}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>eXtendedAIR - Advanced Air Technology</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            background-color: #000;
+            color: #00ff9d;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            position: relative;
+        }
+        
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+        
+        .content {
+            position: relative;
+            z-index: 2;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .title {
+            font-size: clamp(1rem, 10vw, 8rem);
+            font-weight: 300;
+            letter-spacing: 4px;
+            margin-bottom: 2rem;
+            
+            line-height: 0.85;
+            text-shadow: 0 0 20px rgba(0, 255, 157, 0.7);
+        }
+        
+        .title span {
+            display: inline-block;
+            transition: all 0.3s ease;
+        }
+        
+        .title .x { color: #00ff9d; text-shadow: 0 0 25px rgba(0, 255, 255, 0.9); }
+        .title .a { color: #00ff9d; text-shadow: 0 0 25px rgba(0, 255, 157, 0.9); }
+        .title .i { color: #00ff9d; text-shadow: 0 0 25px rgba(0, 255, 157, 0.9); }
+        .title .r { color: #00ff9d; text-shadow: 0 0 25px rgba(0, 255, 157, 0.9); }
+        
+        .subtitle {
+            font-size: clamp(1rem, 3vw, 2rem);
+            max-width: 800px;
+            margin-bottom: 3rem;
+            color: #aaa;
+            line-height: 1.6;
+            text-shadow: 0 0 10px rgba(170, 170, 170, 0.5);
+        }
+        
+        .contact-button {
+            background-color: rgba(100, 100, 100, 0.3);
+            color: #aaa;
+            border: 1px solid rgba(170, 170, 170, 0.3);
+            padding: 15px 40px;
+            font-size: 1.2rem;
+            border-radius: 30px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            display: inline-block;
+            backdrop-filter: blur(5px);
+            box-shadow: 0 0 20px rgba(170, 170, 170, 0.1);
+        }
+        
+        .contact-button:hover {
+            background-color: rgba(100, 100, 100, 0.5);
+            color: #00ff9d;
+            box-shadow: 0 0 30px rgba(0, 255, 157, 0.3);
+            transform: translateY(-3px);
+        }
+        
+        .contact-button:active {
+            transform: translateY(1px);
+        }
+        
+        .footer {
+            position: absolute;
+            bottom: 20px;
+            width: 100%;
+            text-align: center;
+            color: #555;
+            font-size: 0.9rem;
+            z-index: 2;
+        }
+        
+        @media (max-width: 768px) {
+            .title {
+                font-size: clamp(2rem, 20vw, 8rem);
+            }
+            
+            .subtitle {
+                font-size: 1rem;
+                padding: 0 15px;
+            }
+            
+            .contact-button {
+                padding: 12px 30px;
+                font-size: 1rem;
+            }
+        }
+    </style>
 </head>
 <body>
+    <div id="canvas-container"></div>
+    
+    <div class="content">
+        <h1 class="title">
+            <span class="x">e</span>
+            <span class="x">X</span>
+            <span class="a">t</span>
+            <span class="a">e</span>
+            <span class="a">n</span>
+            <span class="a">d</span>
+            <span class="i">e</span>
+            <span class="i">d</span>
+            <span class="r">A</span>
+            <span class="r">I</span>
+            <span class="r">R</span>
+        </h1>
+        
+        <p class="subtitle">
+           
+        </p>
+        
+        <a href="mailto:mikesteveworley@gmail.com?subject=eXtendedAIR" class="contact-button">Contact</a>
+    </div>
 
-<img src="./eaLogo.JPG" alt="extendedair" style="width:50%;">
-
+    <script>
+        // Create a custom 3D point cloud with 2000 particles
+        function createPointCloud() {
+            const scene = new THREE.Scene();
+            const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+            
+            // Create particles
+            const particleCount = 5000;
+            const particles = new THREE.BufferGeometry();
+            const posArray = new Float32Array(particleCount * 3);
+            const colorArray = new Float32Array(particleCount * 3);
+            
+            // Generate positions and colors for particles
+            for (let i = 0; i < particleCount * 3; i += 3) {
+                // Create a sparse distribution around the center
+                posArray[i] = (Math.random() - 0.5) * 20;
+                posArray[i + 1] = (Math.random() - 0.5) * 20;
+                posArray[i + 2] = (Math.random() - 0.5) * 20;
+                
+                // Mid-green color
+                colorArray[i] = 0.0;
+                colorArray[i + 1] = 1.0;
+                colorArray[i + 2] = 0.4;
+            }
+            
+            particles.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+            particles.setAttribute('color', new THREE.BufferAttribute(colorArray, 3));
+            
+            // Create material with custom shader for glowing effect
+            const material = new THREE.PointsMaterial({
+                size: 0.15,
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.9,
+                sizeAttenuation: true
+            });
+            
+            const particleSystem = new THREE.Points(particles, material);
+            scene.add(particleSystem);
+            
+            // Position camera
+            camera.position.z = 5;
+            
+            // Add lighting
+            const ambientLight = new THREE.AmbientLight(0x00ff9d, 0.3);
+            scene.add(ambientLight);
+            
+            const directionalLight = new THREE.DirectionalLight(0x00ff9d, 1);
+            directionalLight.position.set(1, 1, 1);
+            scene.add(directionalLight);
+            
+            // Handle window resize
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+            
+            // Animation loop
+            function animate() {
+                requestAnimationFrame(animate);
+                
+                // Rotate particles slowly
+                particleSystem.rotation.x += 0.001;
+                particleSystem.rotation.y += 0.002;
+                
+                // Animate positions for subtle movement
+                const positions = particles.attributes.position.array;
+                for (let i = 0; i < particleCount * 3; i += 3) {
+                    positions[i] += (Math.random() - 0.5) * 0.002;
+                    positions[i + 1] += (Math.random() - 0.5) * 0.002;
+                    positions[i + 2] += (Math.random() - 0.5) * 0.002;
+                }
+                
+                particles.attributes.position.needsUpdate = true;
+                
+                renderer.render(scene, camera);
+            }
+            
+            animate();
+        }
+        
+        // Initialize when page loads
+        window.addEventListener('load', createPointCloud);
+    </script>
 </body>
 </html>
