@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Universal Wireframe Head (MR + Desktop)</title>
+    <!-- A-Frame 1.5.0 -->
+    <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+    
+    <style>
+        /* Optional: Custom styling for the overlay instructions */
+        #overlay-text {
+            position: absolute;
+            bottom: 20px;
+            left: 0;
+            width: 100%;
+            text-align: center;
+            color: white;
+            font-family: sans-serif;
+            pointer-events: none;
+            text-shadow: 1px 1px 2px black;
+            z-index: 10;
+        }
+        .hidden { display: none; }
+    </style>
+
+    <script>
+        // 1. COMPONENT: WIREFRAME VISUALS
+        AFRAME.registerComponent('wireframe-style', {
+            init: function () {
+                this.el.addEventListener('model-loaded', () => {
+                    const obj = this.el.getObject3D('mesh');
+                    if (!obj) return;
+                    obj.traverse((node) => {
+                        if (node.isMesh) {
+                            node.material = new THREE.MeshStandardMaterial({
+                                color: 0x00ffff,
+                                wireframe: true,
+                                emissive: 0x0044aa,
+                                emissiveIntensity: 0.5,
+                                roughness: 0.5,
+                                metalness: 0.8
+                            });
+                        }
+                    });
+                });
+            }
+        });
+
+        // 2. COMPONENT: PASSTHROUGH MANAGER
+        // Handles switching between Desktop background and MR Transparency
+        AFRAME.registerComponent('passthrough-manager', {
+            init: function() {
+                const scene = this.el.sceneEl;
+                const env = document.getElementById('desktop-environment');
+                
+                // When entering VR/AR/MR
+                scene.addEventListener('enter-vr', () => {
+                    // If we are in AR mode (passthrough supported), hide the fake background
+                    if (scene.is('ar-mode')) {
+                        if(env) env.setAttribute('visible', false);
+                    }
+                });
+
+                // When exiting back to 2D
+                scene.addEventListener('exit-vr', () => {
+                    if(env) env.setAttribute('visible', true);
+                });
+            }
+        });
+
+        // 3. COMPONENT: UNIVERSAL MANIPULATOR
+        // Handles Mouse (Desktop) and Controllers (XR)
+        AFRAME.registerComponent('universal-manipulator', {
+            schema: {
+                selector: {type: 'string', default: '.interactable'},
+                inputType: {type: 'string', default: 'controller'} // 'controller' or 'mouse'
+            },
+
+            init: function () {
+                this.heldObject = null;
+                this.raycaster = this.el.components.raycaster;
+                
+                // --- XR CONTROLLER EVENTS ---
+                if (this.data.inputType === 'controller') {
+                    this.el.addEventListener('selectstart', this.onGrab.bind(this));
+                    this.el.addEventListener('selectend', this.onRelease.bind(this));
+                    this.el.addEventListener('axismove', this.onAxisMove.bind(this));
+                }
+
+                // --- MOUSE / DESKTOP EVENTS ---
+                if (this.data.inputType === 'mouse') {
+                    // A-Frame mouse cursor emits mousedown on the element itself, 
+                    // but we need to intercept it here to manage state.
+                    this.el.addEventListener('mousedown', this.onGrab.bind(this));
+                    this.el.addEventListener('mouseup', this.onRelease.bind(this));
+                    
+                    // Mouse Wheel for scaling
+                    window.addEventListener('wheel', this.onMouseWheel.bind(this));
+                }
+            },
+
+            onGrab: function (evt) {
+                // If we are already holding something, ignore
+                if (this.heldObject) return;
+
+                // Check what the raycaster is hitting
+                const intersections = this.raycaster.intersectedEls;
+                if (intersections.length > 0) {
+                    const hitEl = intersections[0];
+                    if (!hitEl.classList.contains('interactable')) return;
+
+                    this.heldObject = hitEl;
+                    
+                    // PARENTING LOGIC:
+                    // In XR, we attach to the controller.
+                    // On Desktop, we attach to the Camera (so it floats in front of view).
+                    let attachmentTarget = this.el.object3D; // Default: Controller
+                    
+                    if (this.data.inputType === 'mouse') {
+                        // For mouse, attach to the camera 
+                        attachmentTarget = this.el.sceneEl.camera.el.object3D;
+                    }
+
+                    // Three.js attach() keeps the object in the same world position
+                    attachmentTarget.attach(this.heldObject.object3D);
+                    
+                    this.heldObject.emit('start-manipulation');
+                }
+            },
+
+            onRelease: function (evt) {
+                if (this.heldObject) {
+                    // Return object to the Scene root
+                    this.el.sceneEl.object3D.attach(this.heldObject.object3D);
+                    this.heldObject.emit('end-manipulation');
+                    this.heldObject = null;
+                }
+            },
+
+            // XR Scaling (Thumbstick)
+            onAxisMove: function (evt) {
+                if (!this.heldObject) return;
+                // Axis 3 is usually Y on Oculus Touch
+                const thumbstickY = evt.detail.axis[3]; 
+                if (Math.abs(thumbstickY) > 0.2) {
+                    this.applyScale(1 - (thumbstickY * 0.05));
+                }
+            },
+
+            // Desktop Scaling (Scroll Wheel)
+            onMouseWheel: function (evt) {
+                if (!this.heldObject) return;
+                const delta = Math.sign(evt.deltaY);
+                // Scroll down (positive) -> Shrink, Scroll up (negative) -> Grow
+                this.applyScale(1 - (delta * 0.05));
+            },
+
+            applyScale: function (factor) {
+                const currentScale = this.heldObject.object3D.scale;
+                this.heldObject.object3D.scale.set(
+                    Math.max(0.1, currentScale.x * factor),
+                    Math.max(0.1, currentScale.y * factor),
+                    Math.max(0.1, currentScale.z * factor)
+                );
+            }
+        });
+    </script>
+</head>
+<body>
+
+    <!-- HTML OVERLAY FOR INSTRUCTIONS -->
+    <div id="overlay-text">
+        Desktop: Click & Drag to Move | Scroll to Resize<br>
+        VR/MR: Trigger to Move | Thumbstick to Resize
+    </div>
+
+    <!-- 
+        SCENE SETUP
+        xr-mode-ui: Configures the "Enter VR/AR" button. 'AR' prefers Passthrough.
+        renderer="alpha: true": REQUIRED for transparency in MR.
+    -->
+    <a-scene 
+        xr-mode-ui="XRMode: ar"
+        webxr="optionalFeatures: hit-test, local-floor; overlayElement: #overlay-text;"
+        renderer="alpha: true; physicalLights: true; antialias: true;"
+        passthrough-manager>
+
+        <!-- ASSETS -->
+        <a-assets>
+            <a-asset-item id="head-model" src="https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/LeePerrySmith/LeePerrySmith.glb"></a-asset-item>
+        </a-assets>
+
+        <!-- ENVIRONMENT (Desktop/VR Only - Hidden in AR) -->
+        <a-entity id="desktop-environment">
+            <a-sky color="#1a1a1a"></a-sky>
+            <a-grid material="src: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAIklEQVQIW2NkQAKrVq36zwjjgzhhYWGMYAEYB8RmROaABADeOQ8CXl/xfgAAAABJRU5ErkJggg==); repeat: 100 100; opacity:0.2; transparent:true" geometry="primitive: plane; width: 100; height: 100;" rotation="-90 0 0"></a-grid>
+            <a-light type="ambient" intensity="0.3"></a-light>
+            <a-light type="point" position="5 5 5" intensity="1"></a-light>
+        </a-entity>
+
+        <!-- MR LIGHTING (Always visible) -->
+        <a-light type="directional" position="-1 2 1" intensity="1.5" color="#00ffff"></a-light>
+
+        <!-- THE HEAD -->
+        <a-entity 
+            id="mr-head"
+            class="interactable"
+            gltf-model="#head-model" 
+            wireframe-style
+            position="0 1.5 -2" 
+            scale="0.5 0.5 0.5"
+            rotation="0 -45 0"
+            animation__hover="property: position; dir: alternate; dur: 3000; easing: easeInOutSine; loop: true; to: 0 1.6 -2; startEvents: end-manipulation; pauseEvents: start-manipulation">
+        </a-entity>
+
+        <!-- --- RIG & CONTROLS --- -->
+        <a-entity id="rig" position="0 0 0">
+            
+            <!-- CAMERA + MOUSE CURSOR -->
+            <!-- 
+                 rayOrigin: mouse -> Makes the mouse act as a raycaster for Desktop.
+                 fuse: false -> We want click-to-interact, not gaze-to-interact.
+            -->
+            <a-camera look-controls="reverseMouseDrag: true">
+                <a-entity 
+                    cursor="rayOrigin: mouse; fuse: false" 
+                    raycaster="objects: .interactable"
+                    universal-manipulator="inputType: mouse">
+                </a-entity>
+            </a-camera>
+
+            <!-- RIGHT HAND (XR) -->
+            <a-entity 
+                laser-controls="hand: right" 
+                raycaster="objects: .interactable; far: 5"
+                universal-manipulator="inputType: controller">
+            </a-entity>
+
+            <!-- LEFT HAND (XR) -->
+            <a-entity 
+                laser-controls="hand: left" 
+                raycaster="objects: .interactable; far: 5"
+                universal-manipulator="inputType: controller">
+            </a-entity>
+        </a-entity>
+
+    </a-scene>
+</body>
+</html>
