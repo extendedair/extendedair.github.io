@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quest 3 MR Wireframe Head</title>
+    <!-- A-Frame 1.5.0+ is required for latest WebXR features -->
+    <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+    
+    <script>
+        // 1. COMPONENT: WIREFRAME MODIFIER
+        // Turns the detailed model into a cool wireframe upon loading
+        AFRAME.registerComponent('wireframe-style', {
+            init: function () {
+                this.el.addEventListener('model-loaded', () => {
+                    const obj = this.el.getObject3D('mesh');
+                    if (!obj) return;
+
+                    obj.traverse((node) => {
+                        if (node.isMesh) {
+                            // Create a wireframe material
+                            const material = new THREE.MeshStandardMaterial({
+                                color: 0x00ffff, // Cyan color
+                                wireframe: true,
+                                emissive: 0x0044aa,
+                                emissiveIntensity: 0.5,
+                                roughness: 0.5,
+                                metalness: 0.8
+                            });
+                            node.material = material;
+                        }
+                    });
+                });
+            }
+        });
+
+        // 2. COMPONENT: MR MANIPULATOR (Move & Scale)
+        // Handles grabbing with Trigger and Scaling with Thumbstick
+        AFRAME.registerComponent('mr-manipulator', {
+            schema: {
+                selector: {type: 'string', default: '.interactable'}
+            },
+
+            init: function () {
+                this.heldObject = null;
+                this.originalParent = null;
+                
+                // Controller Events
+                this.el.addEventListener('selectstart', this.onGrab.bind(this));
+                this.el.addEventListener('selectend', this.onRelease.bind(this));
+                this.el.addEventListener('axismove', this.onScale.bind(this));
+                
+                // Raycaster configuration
+                this.raycaster = this.el.components.raycaster;
+            },
+
+            onGrab: function (evt) {
+                // Check intersection
+                const intersections = this.raycaster.getIntersection(document.querySelectorAll(this.data.selector));
+                
+                if (intersections.length > 0 && !this.heldObject) {
+                    const hitEl = intersections[0].object.el;
+                    
+                    // Logic to attach object to controller (visual parenting)
+                    this.heldObject = hitEl;
+                    this.originalParent = this.heldObject.object3D.parent;
+                    
+                    // Use Three.js attach to keep world transform while changing parent
+                    this.el.object3D.attach(this.heldObject.object3D);
+                    
+                    // visual feedback
+                    this.heldObject.emit('start-manipulation');
+                }
+            },
+
+            onRelease: function (evt) {
+                if (this.heldObject) {
+                    // Return to original scene parent (usually the scene root)
+                    // We attach to scene to preserve the new position in world space
+                    this.el.sceneEl.object3D.attach(this.heldObject.object3D);
+                    
+                    this.heldObject.emit('end-manipulation');
+                    this.heldObject = null;
+                }
+            },
+
+            onScale: function (evt) {
+                if (!this.heldObject) return;
+
+                // Axis 3 is usually the Y-axis of the thumbstick on Oculus Touch
+                const thumbstickY = evt.detail.axis[3]; 
+                
+                // Deadzone check
+                if (Math.abs(thumbstickY) > 0.2) {
+                    const scaleFactor = 1 - (thumbstickY * 0.05); // Adjust speed here
+                    const currentScale = this.heldObject.object3D.scale;
+                    
+                    // Apply scale uniformly
+                    this.heldObject.object3D.scale.set(
+                        Math.max(0.1, currentScale.x * scaleFactor),
+                        Math.max(0.1, currentScale.y * scaleFactor),
+                        Math.max(0.1, currentScale.z * scaleFactor)
+                    );
+                }
+            }
+        });
+    </script>
+</head>
+<body>
+
+    <!-- 
+      SCENE SETUP 
+      webxr="optionalFeatures: hit-test, local-floor": Standard AR features
+      renderer="alpha: true": Critical for Passthrough (makes background transparent)
+    -->
+    <a-scene 
+        webxr="optionalFeatures: hit-test, local-floor; overlayElement: #dom-overlay;"
+        renderer="alpha: true; physicalLights: true;"
+        background="color: transparent">
+
+        <!-- ASSETS -->
+        <a-assets>
+            <!-- Using the standard Three.js Lee Perry-Smith head model hosted on GitHub CDN -->
+            <a-asset-item id="head-model" src="https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/LeePerrySmith/LeePerrySmith.glb"></a-asset-item>
+        </a-assets>
+
+        <!-- LIGHTING -->
+        <!-- Ambient light for base visibility -->
+        <a-light type="ambient" intensity="0.5"></a-light>
+        <!-- Directional light to catch the wireframe edges -->
+        <a-light type="directional" position="1 2 1" intensity="1.5" color="#ffffff"></a-light>
+
+        <!-- THE HEAD OBJECT -->
+        <!-- 
+             class="interactable": Target for our raycaster
+             wireframe-style: Converts GLB to wireframe
+        -->
+        <a-entity 
+            id="mr-head"
+            class="interactable"
+            gltf-model="#head-model" 
+            wireframe-style
+            position="0 1.5 -1" 
+            scale="0.5 0.5 0.5"
+            rotation="0 -45 0"
+            animation__hover="property: position; dir: alternate; dur: 2000; easing: easeInOutSine; loop: true; to: 0 1.6 -1; startEvents: end-manipulation; pauseEvents: start-manipulation">
+        </a-entity>
+
+        <!-- CONTROLLERS -->
+        <!-- We add raycasters to interact with the head and our custom manipulator component -->
+        
+        <!-- Right Hand: Laser pointer, Grab, Scale -->
+        <a-entity 
+            id="right-hand"
+            laser-controls="hand: right" 
+            raycaster="objects: .interactable; far: 5"
+            mr-manipulator>
+        </a-entity>
+
+        <!-- Left Hand: Laser pointer, Grab, Scale (Mirroring functionality) -->
+        <a-entity 
+            id="left-hand"
+            laser-controls="hand: left" 
+            raycaster="objects: .interactable; far: 5"
+            mr-manipulator>
+        </a-entity>
+
+        <!-- INSTRUCTIONS TEXT -->
+        <!-- Look at text behaves better in AR -->
+        <a-entity position="0 1.9 -1.5" scale="0.8 0.8 0.8">
+            <a-text 
+                value="Point & Trigger to Move\nThumbstick Up/Down to Resize" 
+                align="center" 
+                color="#ffffff" 
+                shader="msdf"
+                font="https://raw.githubusercontent.com/etiennepinchon/aframe-fonts/master/fonts/roboto/Roboto-Bold.json">
+            </a-text>
+        </a-entity>
+
+    </a-scene>
+</body>
+</html>
