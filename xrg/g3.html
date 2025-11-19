@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Neon Horizon MR</title>
+    <style>
+        body { margin: 0; background-color: #111; color: #fff; font-family: 'Courier New', monospace; overflow: hidden; }
+        #overlay { position: absolute; top: 20px; left: 20px; z-index: 100; background: rgba(0,0,0,0.7); padding: 15px; border: 1px solid #0ff; border-radius: 5px; pointer-events: none; }
+        h1 { margin: 0 0 10px; font-size: 1.2em; color: #0ff; text-shadow: 0 0 5px #0ff; }
+        p { margin: 5px 0; font-size: 0.9em; }
+        .highlight { color: #f0f; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div id="overlay">
+        <h1>NEON HORIZON MR</h1>
+        <p>Stick L/R: <span class="highlight">Move</span></p>
+        <p>Triggers: <span class="highlight">Fire Missile</span></p>
+        <p id="status">Put on Quest 3 to Play</p>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+        import { ARButton } from 'https://unpkg.com/three@0.160.0/examples/jsm/webxr/ARButton.js';
+
+        // --- CONFIGURATION ---
+        const SCROLL_SPEED = 15.0; 
+        const WORLD_SCALE = 0.05; // Scaling down to fit comfortably in a room
+        const VIEW_TILT = -25 * (Math.PI / 180);
+        
+        // Gameplay limits
+        const MAX_PLAYER_BULLETS = 3;
+        const MAX_ENEMIES = 3;
+        const MAX_TOWERS = 4;
+        const FIELD_WIDTH = 14;  // Width of play area
+        const SPAWN_Z = -40;     // Distance where things spawn
+        const PLAYER_Z = 8;      // Where player sits relative to center
+        
+        // --- GLOBALS ---
+        let camera, scene, renderer;
+        let worldRoot; // The parent container for the game "board"
+        let clock = new THREE.Clock();
+        
+        // Game State
+        let gameActive = false;
+        let score = 0;
+        let lives = 3;
+        let totalTime = 0;
+
+        // Entities
+        let playerGroup;
+        let terrainMesh, terrainGeo;
+        const enemies = []; // { mesh, collider, hp, nextFire }
+        const towers = [];  // { mesh, collider }
+        const bullets = []; // { mesh, collider, velocity, isPlayer }
+        
+        // Materials
+        const matBlack = new THREE.MeshBasicMaterial({ color: 0x000000 });
+        const matWireTerrain = new THREE.LineBasicMaterial({ color: 0x00ff00, opacity: 0.5, transparent: true });
+        const matWirePlayer = new THREE.LineBasicMaterial({ color: 0x00ffff });
+        const matWireEnemy = new THREE.LineBasicMaterial({ color: 0xff00ff });
+        const matWireTower = new THREE.LineBasicMaterial({ color: 0xffaa00 });
+        const matBulletP = new THREE.MeshBasicMaterial({ color: 0x00ffff });
+        const matBulletE = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+
+        // HUD
+        let hudTexture, hudContext, hudMesh;
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 50);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Add AR Button
+            document.body.appendChild(ARButton.createButton(renderer, { 
+                requiredFeatures: ['local'],
+                optionalFeatures: ['local-floor', 'bounded-floor']
+            }));
+
+            // Lighting (Basic ambient for solid meshes if we used standard material, 
+            // but we are using BasicMaterial which is unlit, so this is optional)
+            const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+            scene.add(light);
+
+            setupGameWorld();
+            setupControllers();
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function setupGameWorld() {
+            // 1. Create World Root
+            // Placed slightly forward and down from user's head (0,0,0 in local space)
+            worldRoot = new THREE.Group();
+            worldRoot.position.set(0, -0.5, -1.2); 
+            worldRoot.rotation.x = VIEW_TILT;
+            // Scale everything to be toy-sized but internally we use large units
+            worldRoot.scale.setScalar(WORLD_SCALE); 
+            scene.add(worldRoot);
+
+            // 2. Terrain
+            // High segment count for smooth hills
+            terrainGeo = new THREE.PlaneGeometry(FIELD_WIDTH + 10, 60, 30, 60);
+            terrainGeo.rotateX(-Math.PI / 2); // Flat
+            
+            // We combine a black solid mesh (to hide things behind hills) 
+            // with a wireframe mesh (for the retro look)
+            const terrainSolid = new THREE.Mesh(terrainGeo, matBlack);
+            
+            // Create wireframe helper
+            // We can't use WireframeGeometry easily if we want to animate vertices cheaply.
+            // Instead we just render the plane as wireframe on top? 
+            // Better: Mesh with wireframe: true? No, diagonals look messy.
+            // Let's use LineSegments with WireframeGeometry but update it? Too heavy.
+            // Simple approach: The solid mesh has `wireframe: true` material overlay.
+            const terrainWire = new THREE.Mesh(terrainGeo, new THREE.MeshBasicMaterial({ 
+                color: 0x00ff00, 
+                wireframe: true,
+                transparent: true,
+                opacity: 0.3
+            }));
+            
+            // To prevent z-fighting, lift wire slightly? Or just add both to group.
+            terrainMesh = new THREE.Group();
+            terrainMesh.add(terrainSolid);
+            terrainMesh.add(terrainWire);
+            worldRoot.add(terrainMesh);
+
+            // 3. Player
+            createPlayer();
+
+            // 4. HUD
+            createHUD();
+            
+            resetGame();
+        }
+
+        function createPlayer() {
+            playerGroup = new THREE.Group();
+            
+            // Visuals: A cool retro fighter
+            // Body
+            const geom = new THREE.ConeGeometry(1, 3, 4, 1, true);
+            geom.rotateX(Math.PI/2); // Point forward
+            const edges = new THREE.WireframeGeometry(geom);
+            const line = new THREE.LineSegments(edges, matWirePlayer);
+            
+            // Wings
+            const wingGeom = new THREE.BufferGeometry();
+            const wingVerts = new Float32Array([
+                0, 0, 0,   2, 0, 1,   0, 0, 1.5, // Left
+                0, 0, 0,  -2, 0, 1,   0, 0, 1.5  // Right
+            ]);
+            wingGeom.setAttribute('position', new THREE.BufferAttribute(wingVerts, 3));
+            const wingMesh = new THREE.Line(wingGeom, matWirePlayer);
+            
+            // Solid interior to block terrain
+            const solidCone = new THREE.Mesh(geom, matBlack);
+
+            playerGroup.add(solidCone);
+            playerGroup.add(line);
+            playerGroup.add(wingMesh);
+            
+            // Collider Box (Invisible)
+            playerGroup.userData = { 
+                collider: new THREE.Box3(),
+                velocity: new THREE.Vector3() 
+            };
+
+            worldRoot.add(playerGroup);
+        }
+
+        function setupControllers() {
+            const controller1 = renderer.xr.getController(0);
+            const controller2 = renderer.xr.getController(1);
+
+            const onTrigger = () => firePlayerMissile();
+            controller1.addEventListener('selectstart', onTrigger);
+            controller2.addEventListener('selectstart', onTrigger);
+
+            scene.add(controller1);
+            scene.add(controller2);
+        }
+
+        function createHUD() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512; 
+            canvas.height = 256;
+            hudContext = canvas.getContext('2d');
+            hudTexture = new THREE.CanvasTexture(canvas);
+            
+            const mat = new THREE.MeshBasicMaterial({ map: hudTexture, transparent: true, side: THREE.DoubleSide });
+            const geo = new THREE.PlaneGeometry(15, 7.5);
+            hudMesh = new THREE.Mesh(geo, mat);
+            
+            // Position HUD floating above the end of the track
+            hudMesh.position.set(0, 12, SPAWN_Z + 5);
+            worldRoot.add(hudMesh);
+        }
+
+        function updateHUD() {
+            const ctx = hudContext;
+            ctx.clearRect(0, 0, 512, 256);
+            
+            // Background panel
+            ctx.fillStyle = "rgba(0, 20, 40, 0.8)";
+            ctx.fillRect(0,0, 512, 256);
+            ctx.strokeStyle = "#00ffff";
+            ctx.lineWidth = 5;
+            ctx.strokeRect(0,0, 512, 256);
+
+            // Text
+            ctx.textAlign = "center";
+            ctx.fillStyle = "#ffffff";
+            
+            if (gameActive) {
+                ctx.font = "40px Courier New";
+                ctx.fillText(`SCORE: ${score}`, 256, 80);
+                
+                ctx.font = "30px Courier New";
+                ctx.fillStyle = lives < 2 ? "#ff0000" : "#00ff00";
+                ctx.fillText(`CRAFT STATUS: ${lives} ACTIVE`, 256, 140);
+                
+                ctx.fillStyle = "#aaaaaa";
+                ctx.font = "20px Courier New";
+                ctx.fillText("DEFEND THE GRID", 256, 200);
+            } else {
+                ctx.fillStyle = "#ff0000";
+                ctx.font = "60px Courier New";
+                ctx.fillText("MISSION FAILED", 256, 100);
+                ctx.fillStyle = "#ffffff";
+                ctx.font = "30px Courier New";
+                ctx.fillText("PULL TRIGGER TO RESTART", 256, 180);
+            }
+            
+            hudTexture.needsUpdate = true;
+        }
+
+        // --- GAME LOGIC ---
+
+        function resetGame() {
+            score = 0;
+            lives = 3;
+            gameActive = true;
+            totalTime = 0;
+            
+            // Clean up scene
+            [...enemies, ...towers, ...bullets].forEach(obj => worldRoot.remove(obj.mesh));
+            enemies.length = 0;
+            towers.length = 0;
+            bullets.length = 0;
+            
+            playerGroup.position.set(0, 5, PLAYER_Z);
+            updateHUD();
+            document.getElementById('status').innerText = "Game Active";
+        }
+
+        // Math for the undulating terrain
+        // Returns Y height for a given X, Z coordinate at current Time
+        function getTerrainHeight(x, z, t) {
+            // Use time to offset Z phase, simulating movement
+            const zOffset = z + (t * SCROLL_SPEED);
+            
+            // Simple combination of sine waves
+            const h1 = Math.sin(x * 0.3) * 2.0; // Large X wave (hills left/right)
+            const h2 = Math.sin(zOffset * 0.2) * 3.0; // Rolling wave forward/back
+            const h3 = Math.cos(zOffset * 0.5 + x * 0.5) * 1.0; // Detail
+            
+            return h1 + h2 + h3 - 4.0; // -4.0 to keep it mostly below 0
+        }
+
+        function updateTerrain(time) {
+            const positions = terrainGeo.attributes.position;
+            const v = new THREE.Vector3();
+
+            for (let i = 0; i < positions.count; i++) {
+                // Get original x, z (plane was rotated, so local y is z)
+                // Geometry is PlaneGeometry(w, h), rotated -90 X.
+                // Position data: x, y, z. 
+                // Wait, PlaneGeometry is defined on XY plane. We rotated the MESH or geometry?
+                // We did `terrainGeo.rotateX(-Math.PI/2)`.
+                // So vertex data x is x, y is height (originally z), z is depth (originally -y).
+                
+                v.fromBufferAttribute(positions, i);
+                // v.x = world x, v.y = world y (height), v.z = world z
+                
+                // Calculate new height
+                v.y = getTerrainHeight(v.x, v.z, time);
+                
+                positions.setY(i, v.y);
+            }
+            positions.needsUpdate = true;
+            terrainGeo.computeVertexNormals(); // For lighting if we had it
+        }
+
+        function spawnTower() {
+            if (towers.length >= MAX_TOWERS) return;
+
+            const height = 3 + Math.random() * 4;
+            const width = 1.5;
+            
+            // Box Geometry
+            const geom = new THREE.BoxGeometry(width, height, width);
+            // Lift geom so origin is at bottom
+            geom.translate(0, height/2, 0);
+            
+            const solid = new THREE.Mesh(geom, matBlack);
+            const wire = new THREE.LineSegments(new THREE.WireframeGeometry(geom), matWireTower);
+            const group = new THREE.Group();
+            group.add(solid);
+            group.add(wire);
+
+            // Random X
+            const posX = (Math.random() - 0.5) * FIELD_WIDTH;
+            
+            group.position.set(posX, 0, SPAWN_Z);
+            
+            worldRoot.add(group);
+            towers.push({ mesh: group, collider: new THREE.Box3(), height: height });
+        }
+
+        function spawnEnemy() {
+            if (enemies.length >= MAX_ENEMIES) return;
+
+            const geom = new THREE.OctahedronGeometry(1.5);
+            const solid = new THREE.Mesh(geom, matBlack);
+            const wire = new THREE.LineSegments(new THREE.WireframeGeometry(geom), matWireEnemy);
+            const group = new THREE.Group();
+            group.add(solid);
+            group.add(wire);
+
+            const posX = (Math.random() - 0.5) * (FIELD_WIDTH - 4);
+            group.position.set(posX, 0, SPAWN_Z);
+
+            worldRoot.add(group);
+            enemies.push({ 
+                mesh: group, 
+                collider: new THREE.Box3(), 
+                hp: 1, 
+                nextFire: totalTime + 1 + Math.random() 
+            });
+        }
+
+        function firePlayerMissile() {
+            if (!gameActive) {
+                resetGame();
+                return;
+            }
+            
+            const active = bullets.filter(b => b.isPlayer).length;
+            if (active >= MAX_PLAYER_BULLETS) return;
+
+            const geom = new THREE.IcosahedronGeometry(0.3);
+            const mesh = new THREE.Mesh(geom, matBulletP);
+            mesh.position.copy(playerGroup.position);
+            // Start slightly ahead
+            mesh.position.z -= 1; 
+            
+            worldRoot.add(mesh);
+            bullets.push({
+                mesh: mesh,
+                collider: new THREE.Box3(),
+                velocity: new THREE.Vector3(0, 0, -30), // Shoot forward (-Z)
+                isPlayer: true
+            });
+        }
+
+        function fireEnemyBullet(enemy) {
+            const geom = new THREE.SphereGeometry(0.4);
+            const mesh = new THREE.Mesh(geom, matBulletE);
+            mesh.position.copy(enemy.mesh.position);
+            mesh.position.z += 1; // Start in front of enemy
+
+            worldRoot.add(mesh);
+            bullets.push({
+                mesh: mesh,
+                collider: new THREE.Box3(),
+                velocity: new THREE.Vector3(0, 0, 15), // Shoot straight back at player (+Z)
+                isPlayer: false
+            });
+        }
+
+        function handleInput() {
+            const session = renderer.xr.getSession();
+            let inputX = 0;
+            
+            if (session) {
+                for (const source of session.inputSources) {
+                    if (source.gamepad && source.gamepad.axes.length > 2) {
+                        // Sum inputs from both sticks
+                        inputX += source.gamepad.axes[2]; 
+                    }
+                }
+            }
+
+            // Apply movement
+            if (Math.abs(inputX) > 0.1) {
+                playerGroup.position.x += inputX * 0.3;
+            }
+            
+            // Clamp to field
+            playerGroup.position.x = Math.max(-FIELD_WIDTH/2, Math.min(FIELD_WIDTH/2, playerGroup.position.x));
+            
+            // Update Height based on terrain + hover offset
+            const groundH = getTerrainHeight(playerGroup.position.x, playerGroup.position.z, totalTime);
+            // Smooth lerp to height or hard set? Hard set is more responsive.
+            // Keep player a fixed height *above* the waving ground
+            const hoverHeight = 4.0; 
+            playerGroup.position.y = groundH + hoverHeight;
+            
+            // Bank animation
+            playerGroup.rotation.z = -inputX * 0.5;
+        }
+
+        function updateEntities(dt) {
+            const scrollMove = SCROLL_SPEED * dt;
+
+            // 1. Towers
+            for (let i = towers.length - 1; i >= 0; i--) {
+                const t = towers[i];
+                t.mesh.position.z += scrollMove;
+                
+                // Update Y to sit on terrain
+                t.mesh.position.y = getTerrainHeight(t.mesh.position.x, t.mesh.position.z, totalTime);
+
+                if (t.mesh.position.z > PLAYER_Z + 5) {
+                    worldRoot.remove(t.mesh);
+                    towers.splice(i, 1);
+                }
+            }
+
+            // 2. Enemies
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                const e = enemies[i];
+                
+                // Enemies move forward with scroll, maybe slight adjustment
+                e.mesh.position.z += scrollMove * 1.0; 
+                
+                // Bobbing logic
+                const terrainY = getTerrainHeight(e.mesh.position.x, e.mesh.position.z, totalTime);
+                e.mesh.position.y = terrainY + 3.0; // Fly 3 units above ground
+
+                // Shooting
+                if (totalTime > e.nextFire && e.mesh.position.z < PLAYER_Z - 5) {
+                    fireEnemyBullet(e);
+                    e.nextFire = totalTime + 1.5 + Math.random();
+                }
+
+                if (e.mesh.position.z > PLAYER_Z + 5) {
+                    worldRoot.remove(e.mesh);
+                    enemies.splice(i, 1);
+                }
+            }
+
+            // 3. Bullets
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                const b = bullets[i];
+                b.mesh.position.addScaledVector(b.velocity, dt);
+                
+                if (b.mesh.position.z < SPAWN_Z - 10 || b.mesh.position.z > PLAYER_Z + 10) {
+                    worldRoot.remove(b.mesh);
+                    bullets.splice(i, 1);
+                }
+            }
+
+            // Spawning
+            if (Math.random() < 0.015) spawnTower();
+            if (Math.random() < 0.01) spawnEnemy();
+        }
+
+        function checkCollisions() {
+            // Update collider for player
+            playerGroup.userData.collider.setFromObject(playerGroup);
+            // Shrink slightly to be forgiving
+            playerGroup.userData.collider.expandByScalar(-0.3); 
+
+            const playerBox = playerGroup.userData.collider;
+
+            // 1. Player vs Towers
+            for (let t of towers) {
+                t.collider.setFromObject(t.mesh);
+                if (playerBox.intersectsBox(t.collider)) {
+                    takeDamage();
+                    return; // Invuln frame logic handled by reset usually, but here instant reset
+                }
+            }
+
+            // 2. Player vs Enemies (Crash)
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                const e = enemies[i];
+                e.collider.setFromObject(e.mesh);
+                if (playerBox.intersectsBox(e.collider)) {
+                    takeDamage();
+                    destroyEnemy(i);
+                    return;
+                }
+            }
+
+            // 3. Bullets
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                const b = bullets[i];
+                b.collider.setFromObject(b.mesh);
+
+                if (b.isPlayer) {
+                    // Check vs Enemies
+                    let hit = false;
+                    for (let j = enemies.length - 1; j >= 0; j--) {
+                        const e = enemies[j];
+                        e.collider.setFromObject(e.mesh);
+                        if (b.collider.intersectsBox(e.collider)) {
+                            score += 10;
+                            destroyEnemy(j);
+                            updateHUD();
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if (hit) {
+                        worldRoot.remove(b.mesh);
+                        bullets.splice(i, 1);
+                    }
+                } else {
+                    // Check vs Player
+                    if (b.collider.intersectsBox(playerBox)) {
+                        takeDamage();
+                        worldRoot.remove(b.mesh);
+                        bullets.splice(i, 1);
+                        return;
+                    }
+                }
+            }
+        }
+
+        function destroyEnemy(index) {
+            const e = enemies[index];
+            worldRoot.remove(e.mesh);
+            enemies.splice(index, 1);
+            // Could add particle explosion here
+        }
+
+        function takeDamage() {
+            lives--;
+            updateHUD();
+            
+            // Visual shake
+            worldRoot.position.x += (Math.random()-0.5) * 0.5;
+            setTimeout(() => worldRoot.position.x = 0, 50);
+
+            if (lives <= 0) {
+                gameActive = false;
+                updateHUD();
+            } else {
+                // Respawn clear
+                enemies.forEach(e => { if(e.mesh.position.z > -10) e.mesh.position.z = SPAWN_Z; });
+                towers.forEach(t => { if(t.mesh.position.z > -10) t.mesh.position.z = SPAWN_Z; });
+                bullets.forEach(b => worldRoot.remove(b.mesh));
+                bullets.length = 0;
+            }
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render() {
+            const dt = clock.getDelta();
+            
+            if (gameActive) {
+                totalTime += dt;
+                handleInput();
+                updateTerrain(totalTime);
+                updateEntities(dt);
+                checkCollisions();
+            } else {
+                // Idle rotation of world
+                worldRoot.rotation.y = Math.sin(clock.getElapsedTime() * 0.2) * 0.1;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+    </script>
+</body>
+</html>
