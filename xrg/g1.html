@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MR Tempest: Wireframe Wars</title>
+    <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+    
+    <style>
+        body { font-family: 'Courier New', Courier, monospace; }
+        /* 2D UI Overlay */
+        #ui-layer {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 10;
+        }
+        .btn {
+            pointer-events: auto;
+            background: rgba(0, 255, 255, 0.2);
+            border: 2px solid #00ffff;
+            color: #00ffff;
+            padding: 20px 40px;
+            font-size: 24px;
+            font-weight: bold;
+            cursor: pointer;
+            text-transform: uppercase;
+            box-shadow: 0 0 10px #00ffff;
+            transition: transform 0.1s;
+        }
+        .btn:active { transform: scale(0.95); background: rgba(0, 255, 255, 0.5); }
+        .hidden { display: none !important; }
+        #score-board {
+            position: absolute;
+            top: 10%;
+            font-size: 40px;
+            color: yellow;
+            text-shadow: 0 0 5px red;
+            display: none; /* Shown in VR via 3D text, this is fallback */
+        }
+    </style>
+
+    <script>
+        // --- GLOBAL GAME STATE ---
+        const GAME = {
+            state: 'menu', // menu, playing, gameover
+            score: 0,
+            lives: 3,
+            tunnelRadius: 2,
+            playerAngle: Math.PI / 2, // Start bottom center (90 deg)
+            bullets: [],
+            enemyBullets: [],
+            towers: [],
+            lastShotTime: 0,
+            headPosition: new THREE.Vector3(0, 0, -10)
+        };
+
+        // --- 1. VISUALS: WIREFRAME SHADER ---
+        AFRAME.registerComponent('wireframe-style', {
+            init: function () {
+                this.el.addEventListener('model-loaded', () => {
+                    const obj = this.el.getObject3D('mesh');
+                    if (!obj) return;
+                    obj.traverse((node) => {
+                        if (node.isMesh) {
+                            node.material = new THREE.MeshStandardMaterial({
+                                color: 0x00ffff,
+                                wireframe: true,
+                                emissive: 0x002244,
+                                emissiveIntensity: 0.8
+                            });
+                        }
+                    });
+                });
+            }
+        });
+
+        // --- 2. COMPONENT: TUNNEL GENERATOR ---
+        // Generates the undulating grid lines
+        AFRAME.registerComponent('tunnel-system', {
+            init: function () {
+                this.lines = [];
+                this.numSlices = 20;
+                this.depth = 20;
+                const material = new THREE.LineBasicMaterial({ color: 0xff00ff, opacity: 0.5, transparent: true });
+                
+                // Create moving horizontal slices
+                for (let i = 0; i < this.numSlices; i++) {
+                    const geometry = new THREE.EdgesGeometry(new THREE.CylinderGeometry(GAME.tunnelRadius, GAME.tunnelRadius, 0.1, 16, 1, true, 0, Math.PI));
+                    const line = new THREE.LineSegments(geometry, material);
+                    // Rotate to be a "bowl" shape (bottom half)
+                    line.rotation.z = Math.PI / 2; 
+                    line.rotation.y = Math.PI / 2; 
+                    
+                    // Initial Z pos
+                    line.position.z = -i * (this.depth / this.numSlices);
+                    
+                    this.el.object3D.add(line);
+                    this.lines.push(line);
+                }
+                
+                // Create static longitudinal lines (rails)
+                const railGeo = new THREE.BufferGeometry();
+                const vertices = [];
+                const segments = 16;
+                for(let i=0; i<=segments; i++) {
+                    const theta = Math.PI * (i/segments);
+                    const x = GAME.tunnelRadius * Math.cos(theta);
+                    const y = -GAME.tunnelRadius * Math.sin(theta); // Bottom half
+                    // Line from Z=0 to Z=-Depth
+                    vertices.push(x, y, 2, x, y, -this.depth);
+                }
+                railGeo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+                const rails = new THREE.LineSegments(railGeo, new THREE.LineBasicMaterial({ color: 0x0044aa }));
+                this.el.object3D.add(rails);
+            },
+            tick: function (t) {
+                if (GAME.state !== 'playing') return;
+                
+                // Move slices forward and undulate
+                const speed = 0.005 * (t % 100000);
+                this.lines.forEach((line, i) => {
+                    line.position.z += 0.05; // Speed
+                    
+                    // Loop logic
+                    if (line.position.z > 1) {
+                        line.position.z = -this.depth + 1;
+                    }
+
+                    // Undulation Effect (Synthwave ripple)
+                    const wave = Math.sin((t * 0.002) + (line.position.z * 0.5));
+                    line.scale.setScalar(1 + (wave * 0.05));
+                    line.position.y = wave * 0.2;
+                });
+            }
+        });
+
+        // --- 3. COMPONENT: PLAYER CONTROLLER ---
+        AFRAME.registerComponent('player-craft', {
+            init: function () {
+                GAME.playerEl = this.el;
+                this.el.object3D.position.z = 0.5; // Slightly in front
+                
+                // Input Listeners
+                this.el.sceneEl.addEventListener('axismove', (e) => {
+                    // Left stick is usually axis 2 (x)
+                    if(e.target.id === 'left-controller') {
+                        this.stickX = e.detail.axis[2];
+                    }
+                });
+                
+                this.el.sceneEl.addEventListener('triggerdown', this.shoot.bind(this));
+            },
+            shoot: function () {
+                if (GAME.state !== 'playing') return;
+                
+                // Max 3 bullets
+                const activeBullets = GAME.bullets.filter(b => b.active).length;
+                if (activeBullets >= 3) return;
+
+                // Spawn Bullet
+                const bulletEl = document.createElement('a-entity');
+                bulletEl.setAttribute('geometry', 'primitive: sphere; radius: 0.05');
+                bulletEl.setAttribute('material', 'color: yellow; emissive: yellow; emissiveIntensity: 2');
+                
+                // Calculate position on rim
+                const pos = this.el.object3D.position;
+                bulletEl.object3D.position.copy(pos);
+                
+                // Velocity vector towards center/horizon (simplified to Z-)
+                // For a true Tempest feel, it goes down the "tube" line. 
+                // We approximate by shooting towards (0,0,-20) adjusted by angle
+                bulletEl.velocity = new THREE.Vector3(0, 0, -0.3);
+
+                document.getElementById('game-world').appendChild(bulletEl);
+                
+                GAME.bullets.push({
+                    el: bulletEl,
+                    active: true,
+                    type: 'player'
+                });
+                
+                // Sound
+                this.el.emit('pew'); 
+            },
+            tick: function () {
+                if (GAME.state !== 'playing') return;
+
+                // Move Player along the semi-circle based on Stick input
+                if (this.stickX && Math.abs(this.stickX) > 0.1) {
+                    GAME.playerAngle -= this.stickX * 0.05;
+                    // Clamp to semi-circle (0 to PI)
+                    GAME.playerAngle = Math.max(0, Math.min(Math.PI, GAME.playerAngle));
+                }
+
+                // Update Visual Position
+                // Math: x = r * cos(angle), y = -r * sin(angle)
+                const r = GAME.tunnelRadius;
+                const x = r * Math.cos(GAME.playerAngle);
+                const y = -r * Math.sin(GAME.playerAngle);
+                
+                this.el.object3D.position.x = x;
+                this.el.object3D.position.y = y;
+                
+                // Rotation to face inward/forward
+                this.el.object3D.rotation.z = GAME.playerAngle - (Math.PI/2);
+            }
+        });
+
+        // --- 4. COMPONENT: GAME MANAGER & LOGIC ---
+        AFRAME.registerComponent('game-manager', {
+            init: function () {
+                this.ui = document.getElementById('ui-layer');
+                this.startBtn = document.getElementById('start-btn');
+                this.restartBtn = document.getElementById('restart-btn');
+                this.scoreText = document.getElementById('score-text');
+                this.livesText = document.getElementById('lives-text');
+                
+                this.startBtn.addEventListener('click', () => this.startGame());
+                this.restartBtn.addEventListener('click', () => this.startGame());
+
+                // Head Logic variables
+                this.headEl = document.getElementById('boss-head');
+                this.nextEnemySpawn = 0;
+                this.nextBossShot = 0;
+            },
+
+            startGame: function () {
+                GAME.state = 'playing';
+                GAME.score = 0;
+                GAME.lives = 3;
+                GAME.bullets.forEach(b => b.el.remove());
+                GAME.bullets = [];
+                GAME.towers.forEach(t => t.el.remove());
+                GAME.towers = [];
+                
+                this.ui.classList.add('hidden');
+                this.startBtn.classList.add('hidden');
+                this.restartBtn.classList.add('hidden');
+                
+                this.updateHUD();
+            },
+
+            endGame: function () {
+                GAME.state = 'gameover';
+                this.ui.classList.remove('hidden');
+                this.restartBtn.classList.remove('hidden');
+            },
+
+            updateHUD: function () {
+                this.scoreText.setAttribute('value', `SCORE: ${GAME.score}`);
+                this.livesText.setAttribute('value', `LIVES: ${GAME.lives}`);
+            },
+
+            tick: function (t, dt) {
+                if (GAME.state !== 'playing') return;
+
+                // --- A. BOSS BEHAVIOR ---
+                // Random rotation facing roughly forward
+                const head = this.headEl.object3D;
+                head.rotation.y = Math.sin(t * 0.001) * 0.5; 
+                head.rotation.x = Math.cos(t * 0.0015) * 0.2;
+
+                // Boss Shooting
+                if (t > this.nextBossShot) {
+                    this.spawnBossBullet();
+                    this.nextBossShot = t + 1500 + Math.random() * 1000;
+                }
+
+                // --- B. ENEMY SPAWNING (Towers) ---
+                if (t > this.nextEnemySpawn) {
+                    this.spawnTower();
+                    this.nextEnemySpawn = t + 2000 - Math.min(1500, GAME.score * 50); // Get faster
+                }
+
+                // --- C. PHYSICS & COLLISION LOOP ---
+                // 1. Handle Bullets (Player and Enemy)
+                for (let i = GAME.bullets.length - 1; i >= 0; i--) {
+                    const b = GAME.bullets[i];
+                    if (!b.active) continue;
+
+                    // Move
+                    b.el.object3D.position.add(b.velocity);
+
+                    // Distance Check for Cleanup
+                    const z = b.el.object3D.position.z;
+                    if (z < -25 || z > 5) {
+                        this.destroyBullet(i);
+                        continue;
+                    }
+
+                    // Collision: Player Bullet vs Tower
+                    if (b.type === 'player') {
+                        for (let j = GAME.towers.length - 1; j >= 0; j--) {
+                            const tower = GAME.towers[j];
+                            const dist = b.el.object3D.position.distanceTo(tower.el.object3D.position);
+                            if (dist < 0.5) {
+                                // Hit!
+                                GAME.score++;
+                                this.updateHUD();
+                                this.destroyTower(j);
+                                this.destroyBullet(i);
+                                break;
+                            }
+                        }
+                    } 
+                    // Collision: Enemy Bullet vs Player
+                    else if (b.type === 'enemy') {
+                        const pPos = GAME.playerEl.object3D.position;
+                        const dist = b.el.object3D.position.distanceTo(pPos);
+                        if (dist < 0.3) {
+                            this.playerHit();
+                            this.destroyBullet(i);
+                        }
+                    }
+                }
+
+                // 2. Handle Towers
+                for (let i = GAME.towers.length - 1; i >= 0; i--) {
+                    const tObj = GAME.towers[i];
+                    tObj.el.object3D.position.z += 0.08; // Move towards player
+
+                    // Check if reached player (Collision)
+                    if (tObj.el.object3D.position.z > 0.5) {
+                         const pPos = GAME.playerEl.object3D.position;
+                         const dist = tObj.el.object3D.position.distanceTo(pPos);
+                         
+                         if (dist < 0.5) {
+                             this.playerHit();
+                         }
+                         this.destroyTower(i);
+                    }
+                }
+            },
+
+            spawnTower: function () {
+                const el = document.createElement('a-entity');
+                // Random angle on the rim
+                const angle = Math.random() * Math.PI;
+                const r = GAME.tunnelRadius;
+                const x = r * Math.cos(angle);
+                const y = -r * Math.sin(angle);
+
+                // Wireframe Spike
+                el.setAttribute('geometry', 'primitive: cone; radiusBottom: 0.2; height: 1');
+                el.setAttribute('material', 'color: #ff0055; wireframe: true; emissive: #ff0000; emissiveIntensity: 1');
+                el.object3D.position.set(x, y, -20);
+                el.object3D.rotation.x = Math.PI / 2; // Point towards player roughly
+                
+                document.getElementById('game-world').appendChild(el);
+                GAME.towers.push({ el: el });
+            },
+
+            spawnBossBullet: function () {
+                const el = document.createElement('a-entity');
+                el.setAttribute('geometry', 'primitive: octahedron; radius: 0.1');
+                el.setAttribute('material', 'color: #ff0000; emissive: #ff0000; emissiveIntensity: 2');
+                
+                // Spawn from "Eyes" (approximate)
+                const isLeft = Math.random() > 0.5;
+                const eyeOffset = isLeft ? -0.3 : 0.3;
+                el.object3D.position.set(eyeOffset, 1.5, -9); // Just in front of head
+                
+                // Aim at player current position
+                const pPos = GAME.playerEl.object3D.position;
+                const dir = new THREE.Vector3().subVectors(pPos, el.object3D.position).normalize();
+                
+                el.velocity = dir.multiplyScalar(0.15); // Bullet speed
+                
+                document.getElementById('game-world').appendChild(el);
+                GAME.bullets.push({ el: el, active: true, type: 'enemy' });
+            },
+
+            playerHit: function () {
+                GAME.lives--;
+                this.updateHUD();
+                // Visual Shake / Flash (optional)
+                const rig = document.getElementById('rig');
+                rig.setAttribute('animation', 'property: position; from: 0.1 0.1 0; to: 0 0 0; dur: 200');
+                
+                if (GAME.lives <= 0) {
+                    this.endGame();
+                }
+            },
+
+            destroyBullet: function (index) {
+                if (GAME.bullets[index] && GAME.bullets[index].el) {
+                    GAME.bullets[index].el.remove();
+                }
+                GAME.bullets.splice(index, 1);
+            },
+
+            destroyTower: function (index) {
+                if (GAME.towers[index] && GAME.towers[index].el) {
+                    GAME.towers[index].el.remove();
+                }
+                GAME.towers.splice(index, 1);
+            }
+        });
+
+        // --- 5. PASSTHROUGH MANAGER ---
+        AFRAME.registerComponent('passthrough-manager', {
+            init: function() {
+                const scene = this.el.sceneEl;
+                const env = document.getElementById('desktop-env');
+                scene.addEventListener('enter-vr', () => {
+                    if (scene.is('ar-mode') && env) env.setAttribute('visible', false);
+                });
+                scene.addEventListener('exit-vr', () => {
+                    if (env) env.setAttribute('visible', true);
+                });
+            }
+        });
+    </script>
+</head>
+<body>
+    <!-- UI OVERLAY -->
+    <div id="ui-layer">
+        <div id="start-btn" class="btn">START GAME</div>
+        <div id="restart-btn" class="btn hidden">PLAY AGAIN</div>
+    </div>
+
+    <!-- SCENE -->
+    <a-scene 
+        xr-mode-ui="XRMode: ar"
+        webxr="optionalFeatures: hit-test, local-floor; overlayElement: #ui-layer;"
+        renderer="alpha: true; physicalLights: true; antialias: true;"
+        passthrough-manager
+        game-manager>
+
+        <a-assets>
+            <a-asset-item id="head-model" src="https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/LeePerrySmith/LeePerrySmith.glb"></a-asset-item>
+        </a-assets>
+
+        <!-- DESKTOP FALLBACK ENV -->
+        <a-entity id="desktop-env">
+            <a-sky color="#050505"></a-sky>
+            <a-light type="ambient" intensity="0.3"></a-light>
+        </a-entity>
+
+        <!-- GAME CONTAINER (Offset for comfort) -->
+        <a-entity id="game-world" position="0 1.2 -1">
+
+            <!-- TUNNEL LANDSCAPE -->
+            <a-entity tunnel-system position="0 0 0"></a-entity>
+
+            <!-- THE BOSS HEAD -->
+            <a-entity id="boss-container" position="0 0.5 -10">
+                <!-- Score Board Attached to Head -->
+                <a-text id="score-text" value="SCORE: 0" position="0 2 0" align="center" width="15" color="yellow" font="mozillavr"></a-text>
+                <a-text id="lives-text" value="LIVES: 3" position="0 1.5 0" align="center" width="10" color="red" font="mozillavr"></a-text>
+
+                <a-entity 
+                    id="boss-head"
+                    gltf-model="#head-model" 
+                    wireframe-style
+                    scale="1.5 1.5 1.5"
+                    rotation="0 180 0">
+                </a-entity>
+            </a-entity>
+
+            <!-- PLAYER CRAFT -->
+            <a-entity player-craft>
+                <!-- The Claw Shape -->
+                <a-entity rotation="0 0 0">
+                    <a-entity geometry="primitive: cone; radiusBottom: 0.05; height: 0.2" material="color: yellow; wireframe: true" rotation="90 0 0" position="0.1 0 0"></a-entity>
+                    <a-entity geometry="primitive: cone; radiusBottom: 0.05; height: 0.2" material="color: yellow; wireframe: true" rotation="90 0 0" position="-0.1 0 0"></a-entity>
+                    <a-box width="0.3" height="0.05" depth="0.05" color="cyan" wireframe="true"></a-box>
+                </a-entity>
+            </a-entity>
+
+        </a-entity> <!-- End Game World -->
+
+        <!-- CONTROLLERS -->
+        <a-entity id="rig">
+             <a-camera position="0 1.6 0" look-controls="reverseMouseDrag:true"></a-camera>
+             <a-entity id="left-controller" oculus-touch-controls="hand: left"></a-entity>
+             <a-entity id="right-controller" oculus-touch-controls="hand: right"></a-entity>
+        </a-entity>
+
+        <!-- LIGHTING -->
+        <a-light type="directional" color="#00ffff" intensity="1" position="-1 1 0"></a-light>
+        <a-light type="directional" color="#ff00ff" intensity="1" position="1 1 0"></a-light>
+
+    </a-scene>
+</body>
+</html>
