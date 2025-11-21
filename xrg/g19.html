@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>TEMPESTUOUS</title>
+    <style>
+        /* FORCE TRANSPARENCY FOR AR */
+        html, body { 
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: transparent !important;
+            overflow: hidden; 
+            font-family: 'Courier New', monospace; 
+        }
+
+        /* 2D MENU */
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column;
+            justify-content: center; align-items: center;
+            background: rgba(0, 0, 0, 0.8); 
+            z-index: 999;
+        }
+
+        #game-menu {
+            border: 2px solid #0f0; 
+            padding: 30px; border-radius: 0px; 
+            text-align: center; color: white; background: rgba(0, 20, 0, 0.9);
+            max-width: 400px;
+            box-shadow: 0 0 20px #0f0;
+        }
+
+        h1 { color: #0f0; margin-bottom: 10px; text-shadow: 0 0 10px #0f0; letter-spacing: 3px; }
+        p { margin: 5px 0; font-size: 1.1em; }
+        .highlight { color: #fff; font-weight: bold; }
+
+        /* Hide 2D UI in AR */
+        body.xr-active #ui-layer { display: none !important; }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <div id="game-menu">
+            <h1>TEMPESTUOUS</h1>
+            <p>Stick L/R: <span class="highlight">Move</span></p>
+            <p>Triggers: <span class="highlight">Fire</span></p>
+            <p style="font-size:0.8em; color:#8f8; margin-top:15px;">
+                10 Levels.<br>
+                TEST MODE: 10s Waves.<br>
+                Click screen to enable Audio.
+            </p>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+        import { ARButton } from 'https://unpkg.com/three@0.160.0/examples/jsm/webxr/ARButton.js';
+
+        // --- CONFIGURATION ---
+        const WORLD_SCALE = 0.06;
+        const SCROLL_SPEED = 15.0;
+        const VIEW_TILT = 30 * (Math.PI / 180);
+        
+        // Distances & Sizes
+        const SPAWN_Z = -45;
+        const BOSS_SPAWN_Z = -50;
+        const HUD_Z = -70; 
+        const PLAYER_Z = 8;
+        const FIELD_WIDTH = 14;
+        const LEVEL_DURATION = 10; // Testing: 10s
+
+        // Hit Radii
+        const HIT_RADIUS_PLAYER = 1.0;
+        const HIT_RADIUS_ENEMY = 1.8;
+        const HIT_RADIUS_TOWER = 2.0;
+        const HIT_RADIUS_BOSS = 5.0;
+
+        // --- AUDIO SYSTEM ---
+        let audioCtx = null;
+        let noiseBuffer = null;
+        let sirenOsc = null;
+        let sirenGain = null;
+        let sirenLfo = null;
+        
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                // Generate White Noise Buffer
+                const bufferSize = audioCtx.sampleRate * 4.0; 
+                noiseBuffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+                const data = noiseBuffer.getChannelData(0);
+                for (let i = 0; i < bufferSize; i++) {
+                    data[i] = Math.random() * 2 - 1;
+                }
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+
+        function playSound(type) {
+            if (!audioCtx) return;
+            const t = audioCtx.currentTime;
+            const gain = audioCtx.createGain();
+            gain.connect(audioCtx.destination);
+
+            if (type === 'shoot') {
+                // High square wave beep
+                const osc = audioCtx.createOscillator();
+                osc.connect(gain);
+                osc.type = 'square';
+                osc.frequency.setValueAtTime(880, t);
+                osc.frequency.exponentialRampToValueAtTime(110, t + 0.1);
+                gain.gain.setValueAtTime(0.1, t);
+                gain.gain.exponentialRampToValueAtTime(0.01, t + 0.1);
+                osc.start(t);
+                osc.stop(t + 0.1);
+            } else if (type === 'explode') {
+                // White Noise Burst (Short)
+                const src = audioCtx.createBufferSource();
+                src.buffer = noiseBuffer;
+                const filter = audioCtx.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.value = 1000;
+                src.connect(filter);
+                filter.connect(gain);
+                gain.gain.setValueAtTime(0.5, t);
+                gain.gain.exponentialRampToValueAtTime(0.01, t + 0.4);
+                src.start(t);
+                src.stop(t + 0.4);
+            } else if (type === 'bossDeath') {
+                // Deep, Long Noise
+                const src = audioCtx.createBufferSource();
+                src.buffer = noiseBuffer;
+                const filter = audioCtx.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.value = 800;
+                filter.frequency.exponentialRampToValueAtTime(100, t + 2.0); // Filter sweep down
+                src.connect(filter);
+                filter.connect(gain);
+                gain.gain.setValueAtTime(0.8, t);
+                gain.gain.exponentialRampToValueAtTime(0.01, t + 2.0);
+                src.start(t);
+                src.stop(t + 2.0);
+            }
+        }
+
+        function toggleSiren(active) {
+            if (!audioCtx) return;
+            if (active && !sirenOsc) {
+                // Create Siren
+                sirenOsc = audioCtx.createOscillator();
+                sirenGain = audioCtx.createGain();
+                sirenLfo = audioCtx.createOscillator();
+                const lfoGain = audioCtx.createGain();
+
+                // LFO controls frequency of SirenOsc
+                sirenLfo.type = 'sine';
+                sirenLfo.frequency.value = 2; // 2Hz Wobble
+                lfoGain.gain.value = 200; // Wobble depth
+                sirenLfo.connect(lfoGain);
+                lfoGain.connect(sirenOsc.frequency);
+
+                sirenOsc.type = 'sawtooth';
+                sirenOsc.frequency.value = 400; // Base freq
+                sirenOsc.connect(sirenGain);
+                sirenGain.connect(audioCtx.destination);
+                
+                sirenGain.gain.value = 0.05; // Low volume
+
+                sirenOsc.start();
+                sirenLfo.start();
+            } else if (!active && sirenOsc) {
+                // Stop Siren
+                sirenOsc.stop();
+                sirenLfo.stop();
+                sirenOsc.disconnect();
+                sirenGain.disconnect();
+                sirenOsc = null;
+            }
+        }
+
+        // --- GEOMETRIES ---
+        const geoms = {
+            bullet: new THREE.IcosahedronGeometry(0.4, 0), 
+            particle: new THREE.BoxGeometry(0.2, 0.2, 0.2),
+            tower: new THREE.BoxGeometry(1.5, 1, 1.5),
+            lvl1: new THREE.OctahedronGeometry(1.5), 
+            lvl2: new THREE.CylinderGeometry(1.5, 1.5, 0.5, 6), 
+            lvl3: new THREE.TorusGeometry(1.0, 0.4, 8, 16), 
+            lvl4: new THREE.SphereGeometry(1.5, 16, 8), 
+            lvl5: new THREE.DodecahedronGeometry(1.5), 
+            lvl6: new THREE.ConeGeometry(1.2, 3, 4), 
+            lvl7: new THREE.CylinderGeometry(1.2, 0.5, 3, 4), 
+            lvl8: new THREE.TetrahedronGeometry(1.8), 
+            lvl9: new THREE.BoxGeometry(2, 1, 3), 
+            lvl10: new THREE.IcosahedronGeometry(1.5, 2) 
+        };
+
+        geoms.lvl4.scale(1, 0.4, 1);
+        geoms.lvl7.rotateX(Math.PI/2);
+        geoms.lvl8.rotateX(-Math.PI/4);
+
+        const LEVEL_GEOMS = [
+            geoms.lvl1, geoms.lvl2, geoms.lvl3, geoms.lvl4, geoms.lvl5,
+            geoms.lvl6, geoms.lvl7, geoms.lvl8, geoms.lvl9, geoms.lvl10
+        ];
+
+        const mats = {
+            black: new THREE.MeshBasicMaterial({ color: 0x000000 }),
+            wirePlayer: new THREE.LineBasicMaterial({ color: 0x00ffff }),
+            wireEnemy: new THREE.LineBasicMaterial({ color: 0xff00ff }),
+            wireTower: new THREE.LineBasicMaterial({ color: 0xffaa00 }),
+            // Boss material is modifiable
+            wireBoss: new THREE.LineBasicMaterial({ color: 0xff0000, linewidth: 2 }),
+            bulletP: new THREE.MeshBasicMaterial({ color: 0x00ffff }),
+            bulletE: new THREE.MeshBasicMaterial({ color: 0xff0000 }),
+            partP: new THREE.MeshBasicMaterial({ color: 0x00ffff }),
+            partE: new THREE.MeshBasicMaterial({ color: 0xff00ff })
+        };
+
+        // --- GLOBALS ---
+        let camera, scene, renderer, worldRoot;
+        let clock = new THREE.Clock();
+        let hudTexture, hudContext, hudMesh;
+
+        // State
+        let gameState = "WAITING";
+        let score = 0;
+        let lives = 10;
+        let currentLevel = 1;
+        let levelTimer = 0;
+        let isBossPhase = false;
+        let invulnTimer = 0;
+
+        // Entities
+        let playerGroup;
+        let terrainGeo;
+        const enemies = [];
+        const towers = [];
+        const bullets = [];
+        const particles = [];
+        let currentBoss = null;
+
+        window.addEventListener('click', initAudio); 
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            const arButton = ARButton.createButton(renderer, { 
+                requiredFeatures: ['local'],
+                optionalFeatures: ['local-floor', 'bounded-floor', 'dom-overlay'],
+                domOverlay: { root: document.body }
+            });
+            document.body.appendChild(arButton);
+
+            renderer.xr.addEventListener('sessionstart', () => {
+                document.body.classList.add('xr-active');
+                initAudio();
+                resetGameFull();
+            });
+            renderer.xr.addEventListener('sessionend', () => {
+                document.body.classList.remove('xr-active');
+                toggleSiren(false);
+            });
+
+            const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+            scene.add(light);
+
+            setupWorld();
+            setupControllers();
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+        }
+
+        function setupWorld() {
+            worldRoot = new THREE.Group();
+            worldRoot.position.set(0, -0.5, -1.5); 
+            worldRoot.rotation.x = VIEW_TILT;
+            worldRoot.scale.setScalar(WORLD_SCALE); 
+            scene.add(worldRoot);
+
+            // Terrain
+            terrainGeo = new THREE.PlaneGeometry(FIELD_WIDTH + 10, 80, 30, 80);
+            terrainGeo.rotateX(-Math.PI / 2);
+            
+            const tSolid = new THREE.Mesh(terrainGeo, mats.black);
+            const tWire = new THREE.Mesh(terrainGeo, new THREE.MeshBasicMaterial({ 
+                color: 0x00ff00, wireframe: true, transparent: true, opacity: 0.3 
+            }));
+            worldRoot.add(tSolid);
+            worldRoot.add(tWire);
+
+            createPlayer();
+            createHUD();
+            updateHUD();
+        }
+
+        function createPlayer() {
+            playerGroup = new THREE.Group();
+            const geom = new THREE.ConeGeometry(1, 3, 4, 1, true);
+            geom.rotateX(Math.PI/2);
+            
+            playerGroup.add(new THREE.Mesh(geom, mats.black));
+            playerGroup.add(new THREE.LineSegments(new THREE.WireframeGeometry(geom), mats.wirePlayer));
+            
+            const wingGeom = new THREE.BufferGeometry();
+            const verts = new Float32Array([0,0,0, 2,0,1, 0,0,1.5,  0,0,0, -2,0,1, 0,0,1.5]);
+            wingGeom.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+            playerGroup.add(new THREE.Line(wingGeom, mats.wirePlayer));
+
+            playerGroup.userData.box = new THREE.Box3();
+            worldRoot.add(playerGroup);
+        }
+
+        function setupControllers() {
+            const c1 = renderer.xr.getController(0);
+            const c2 = renderer.xr.getController(1);
+            const onSelect = () => {
+                if (gameState === "PLAYING") firePlayerMissile();
+                else resetGameFull();
+            };
+            c1.addEventListener('selectstart', onSelect);
+            c2.addEventListener('selectstart', onSelect);
+            scene.add(c1); scene.add(c2);
+        }
+
+        // --- GAME LOGIC ---
+
+        function resetGameFull() {
+            [...enemies, ...towers, ...bullets, ...particles].forEach(e => worldRoot.remove(e.mesh));
+            enemies.length = 0; towers.length = 0; bullets.length = 0; particles.length = 0;
+            if (currentBoss) { worldRoot.remove(currentBoss.mesh); currentBoss = null; }
+            toggleSiren(false);
+
+            score = 0;
+            lives = 10;
+            currentLevel = 1;
+            startLevel(1);
+            
+            gameState = "PLAYING";
+            playerGroup.visible = true;
+            playerGroup.position.set(0, 5, PLAYER_Z);
+            invulnTimer = 0;
+            updateHUD();
+        }
+
+        function startLevel(lvl) {
+            currentLevel = lvl;
+            if (currentLevel > 10) currentLevel = 1;
+            levelTimer = 0;
+            isBossPhase = false;
+            if (currentBoss) { worldRoot.remove(currentBoss.mesh); currentBoss = null; }
+            toggleSiren(false);
+            updateHUD();
+        }
+
+        function spawnBoss() {
+            if (currentBoss) return;
+            isBossPhase = true;
+            toggleSiren(true);
+            
+            const group = new THREE.Group();
+            const geomIdx = (currentLevel - 1) % 10;
+            const geom = LEVEL_GEOMS[geomIdx];
+
+            group.add(new THREE.Mesh(geom, mats.black));
+            group.add(new THREE.LineSegments(new THREE.WireframeGeometry(geom), mats.wireBoss));
+            
+            group.scale.setScalar(3.0);
+            group.position.set(0, 10, BOSS_SPAWN_Z);
+            worldRoot.add(group);
+
+            currentBoss = {
+                mesh: group,
+                hp: 20,
+                nextFire: 0,
+                burstQueue: 0, // Bullets queued to fire
+                box: new THREE.Box3()
+            };
+            updateHUD();
+        }
+
+        function spawnEnemy() {
+            const geomIdx = (currentLevel - 1) % 10;
+            const geom = LEVEL_GEOMS[geomIdx];
+            
+            const group = new THREE.Group();
+            group.add(new THREE.Mesh(geom, mats.black));
+            group.add(new THREE.LineSegments(new THREE.WireframeGeometry(geom), mats.wireEnemy));
+            
+            const posX = (Math.random() - 0.5) * 10;
+            group.position.set(posX, 0, SPAWN_Z);
+            worldRoot.add(group);
+            
+            enemies.push({
+                mesh: group,
+                box: new THREE.Box3(),
+                initialX: posX,
+                phase: Math.random() * 100,
+                nextFire: Math.random() * 2
+            });
+        }
+
+        function spawnTower() {
+            const height = 3 + Math.random() * 4;
+            const solid = new THREE.Mesh(geoms.tower, mats.black);
+            const wire = new THREE.LineSegments(new THREE.WireframeGeometry(geoms.tower), mats.wireTower);
+            solid.scale.y = height; solid.position.y = height / 2;
+            wire.scale.y = height; wire.position.y = height / 2;
+
+            const group = new THREE.Group();
+            group.add(solid); group.add(wire);
+            
+            // Positioning Logic
+            const posX = (Math.random() - 0.5) * 14;
+            const spawnZ = SPAWN_Z;
+            
+            // IMMEDIATE HEIGHT CALCULATION to prevent floating
+            const spawnTime = clock.getElapsedTime();
+            const terrainH = getTerrainHeight(posX, spawnZ, spawnTime);
+            
+            group.position.set(posX, terrainH, spawnZ);
+            
+            worldRoot.add(group);
+            towers.push({ mesh: group, box: new THREE.Box3() });
+        }
+
+        function firePlayerMissile() {
+            if (!playerGroup.visible) return;
+            if (bullets.filter(b => b.isPlayer).length >= 6) return; 
+
+            const mesh = new THREE.Mesh(geoms.bullet, mats.bulletP);
+            mesh.position.copy(playerGroup.position);
+            mesh.position.z -= 2.0; 
+            
+            worldRoot.add(mesh);
+            bullets.push({
+                mesh: mesh,
+                velocity: new THREE.Vector3(0, 0, -45),
+                isPlayer: true
+            });
+            playSound('shoot');
+            spawnParticles(playerGroup.position, true, 5);
+        }
+
+        function fireEnemyBullet(pos) {
+            const mesh = new THREE.Mesh(geoms.bullet, mats.bulletE);
+            mesh.position.copy(pos);
+            mesh.position.z += 2;
+            
+            worldRoot.add(mesh);
+            bullets.push({
+                mesh: mesh,
+                velocity: new THREE.Vector3(0, 0, 25),
+                isPlayer: false
+            });
+        }
+
+        // --- UPDATE LOOP ---
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render() {
+            const dt = Math.min(clock.getDelta(), 0.1);
+            const time = clock.getElapsedTime();
+
+            if (gameState === "PLAYING") {
+                levelTimer += dt;
+                if (levelTimer > LEVEL_DURATION && !isBossPhase) spawnBoss();
+                if (levelTimer > (LEVEL_DURATION + 20)) startLevel(currentLevel + 1);
+
+                updatePlayer(dt, time);
+                updateEntities(dt, time);
+                checkCollisions(); 
+            }
+
+            updateParticles(dt);
+            updateTerrain(time);
+            renderer.render(scene, camera);
+        }
+
+        function updatePlayer(dt, time) {
+            if (invulnTimer > 0) {
+                invulnTimer -= dt;
+                playerGroup.visible = Math.floor(time * 20) % 2 === 0;
+                if (invulnTimer <= 0) { playerGroup.visible = true; updateHUD(); }
+            }
+
+            const session = renderer.xr.getSession();
+            let dx = 0;
+            if (session && session.inputSources) {
+                for (const s of session.inputSources) {
+                    if (s.gamepad && s.gamepad.axes.length > 2) dx += s.gamepad.axes[2];
+                }
+            }
+            if (Math.abs(dx) > 0.1) playerGroup.position.x += dx * 10 * dt;
+            playerGroup.position.x = Math.max(-7, Math.min(7, playerGroup.position.x));
+
+            const h = getTerrainHeight(playerGroup.position.x, playerGroup.position.z, time);
+            playerGroup.position.y = h + 4;
+            playerGroup.rotation.z = -dx * 0.5;
+        }
+
+        function updateEntities(dt, time) {
+            const move = SCROLL_SPEED * dt;
+
+            // Spawning
+            if (!isBossPhase && gameState === "PLAYING") {
+                const maxE = 2 + currentLevel;
+                const maxT = 3 + currentLevel;
+                if (enemies.length < maxE && Math.random() < 0.02) spawnEnemy();
+                if (towers.length < maxT && Math.random() < 0.02) spawnTower();
+            }
+
+            // Boss
+            if (currentBoss) {
+                const b = currentBoss.mesh;
+                
+                // Color Cycling
+                const hue = (time * 0.2) % 1;
+                mats.wireBoss.color.setHSL(hue, 1, 0.5);
+
+                // Movement
+                if (b.position.z < -20) b.position.z += 2 * dt;
+                b.position.x = Math.sin(time) * 6;
+                // Hug Terrain (offset by height/2 roughly)
+                b.position.y = getTerrainHeight(b.position.x, b.position.z, time) + 6.0; 
+                
+                // Chain Fire Logic
+                if (currentBoss.burstQueue > 0) {
+                     if (time > currentBoss.nextFire) {
+                         fireEnemyBullet(b.position);
+                         currentBoss.burstQueue--;
+                         currentBoss.nextFire = time + 0.2; // Fast interval
+                     }
+                } else {
+                    // Start new burst
+                    if (time > currentBoss.nextFire) {
+                        currentBoss.burstQueue = 3 + Math.floor(currentLevel/2); // 3 to 8 shots
+                        currentBoss.nextFire = time; // Fire immediately
+                    }
+                }
+                
+                // Reset burst cycle if empty
+                if (currentBoss.burstQueue === 0 && time > currentBoss.nextFire) {
+                     currentBoss.nextFire = time + 1.5; // Cooldown
+                }
+            }
+
+            // Enemies
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                const e = enemies[i];
+                e.mesh.position.z += move;
+                e.mesh.position.x = e.initialX + Math.sin(time * 2 + e.phase) * 3;
+                e.mesh.position.y = getTerrainHeight(e.mesh.position.x, e.mesh.position.z, time) + 3;
+                
+                if (time > e.nextFire && e.mesh.position.z < PLAYER_Z - 5) {
+                    fireEnemyBullet(e.mesh.position);
+                    e.nextFire = time + 2;
+                }
+                if (e.mesh.position.z > 15) { worldRoot.remove(e.mesh); enemies.splice(i, 1); }
+            }
+
+            // Towers
+            for (let i = towers.length - 1; i >= 0; i--) {
+                const t = towers[i];
+                t.mesh.position.z += move;
+                t.mesh.position.y = getTerrainHeight(t.mesh.position.x, t.mesh.position.z, time);
+                if (t.mesh.position.z > 15) { worldRoot.remove(t.mesh); towers.splice(i, 1); }
+            }
+
+            // Bullets
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                const b = bullets[i];
+                b.mesh.position.addScaledVector(b.velocity, dt);
+                
+                // Terrain Hugging for Bullets
+                const h = getTerrainHeight(b.mesh.position.x, b.mesh.position.z, time);
+                b.mesh.position.y = h + 1.5; 
+                
+                if (b.mesh.position.z < BOSS_SPAWN_Z - 5 || b.mesh.position.z > 20) {
+                    worldRoot.remove(b.mesh);
+                    bullets.splice(i, 1);
+                }
+            }
+        }
+
+        function checkCollisions() {
+            if (invulnTimer > 0 || !playerGroup.visible) return;
+
+            // 1. PHYSICAL CRASHES
+            playerGroup.updateMatrixWorld(true);
+            playerGroup.userData.box.setFromObject(playerGroup);
+            const pSize = new THREE.Vector3(); playerGroup.userData.box.getSize(pSize);
+            playerGroup.userData.box.expandByScalar(-Math.min(pSize.x, pSize.y, pSize.z) * 0.3);
+            const pBox = playerGroup.userData.box;
+
+            // Player vs Tower
+            for (const t of towers) {
+                t.box.setFromObject(t.mesh);
+                if (pBox.intersectsBox(t.box)) return playerHit();
+            }
+
+            // Enemies vs Towers (Enemies die)
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                const e = enemies[i];
+                e.box.setFromObject(e.mesh);
+                
+                // Check vs Player
+                if (pBox.intersectsBox(e.box)) {
+                    playSound('explode');
+                    spawnParticles(e.mesh.position, false, 20);
+                    worldRoot.remove(e.mesh); enemies.splice(i, 1);
+                    return playerHit();
+                }
+
+                // Check vs Towers (Hardening)
+                for (const t of towers) {
+                    if (e.box.intersectsBox(t.box)) {
+                        playSound('explode');
+                        spawnParticles(e.mesh.position, false, 15);
+                        worldRoot.remove(e.mesh); enemies.splice(i, 1);
+                        break; 
+                    }
+                }
+            }
+            
+            // Player vs Boss
+            if (currentBoss) {
+                currentBoss.box.setFromObject(currentBoss.mesh);
+                if (pBox.intersectsBox(currentBoss.box)) return playerHit();
+            }
+
+            // 2. BULLET HITS
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                const b = bullets[i];
+                let hit = false;
+
+                // Bullet vs Tower (BLOCKING for ALL bullets)
+                for (const t of towers) {
+                    if (b.mesh.position.distanceTo(t.mesh.position) < HIT_RADIUS_TOWER) {
+                        hit = true; break; 
+                    }
+                }
+
+                if (!hit) {
+                    if (b.isPlayer) {
+                        // Player Bullet vs Enemy
+                        for (let j = enemies.length - 1; j >= 0; j--) {
+                            if (b.mesh.position.distanceTo(enemies[j].mesh.position) < HIT_RADIUS_ENEMY) {
+                                playSound('explode');
+                                spawnParticles(enemies[j].mesh.position, false, 10);
+                                worldRoot.remove(enemies[j].mesh); enemies.splice(j, 1);
+                                score += 10; updateHUD(); hit = true; break;
+                            }
+                        }
+                        // Player Bullet vs Boss
+                        if (!hit && currentBoss) {
+                            if (b.mesh.position.distanceTo(currentBoss.mesh.position) < HIT_RADIUS_BOSS) {
+                                playSound('explode'); // Use explode sound for hits
+                                spawnParticles(b.mesh.position, false, 5);
+                                currentBoss.hp--;
+                                if (currentBoss.hp <= 0) {
+                                    playSound('bossDeath');
+                                    spawnParticles(currentBoss.mesh.position, false, 50);
+                                    worldRoot.remove(currentBoss.mesh); currentBoss = null;
+                                    toggleSiren(false);
+                                    score += currentLevel * 100; 
+                                    startLevel(currentLevel + 1);
+                                }
+                                hit = true;
+                            }
+                        }
+                    } else {
+                        // Enemy Bullet vs Player
+                        if (b.mesh.position.distanceTo(playerGroup.position) < HIT_RADIUS_PLAYER) {
+                            playerHit(); hit = true;
+                        }
+                    }
+                }
+
+                if (hit) {
+                    worldRoot.remove(b.mesh);
+                    bullets.splice(i, 1);
+                }
+            }
+        }
+
+        function playerHit() {
+            playSound('explode');
+            spawnParticles(playerGroup.position, true, 30);
+            lives--;
+            playerGroup.visible = false;
+            
+            towers.forEach(t => { if(t.mesh.position.z > PLAYER_Z - 10) t.mesh.position.z = -200; });
+            enemies.forEach(e => { if(e.mesh.position.z > PLAYER_Z - 10) e.mesh.position.z = -200; });
+            bullets.forEach(b => worldRoot.remove(b.mesh));
+            bullets.length = 0;
+
+            if (lives <= 0) {
+                gameState = "GAME_OVER";
+                toggleSiren(false);
+            }
+            else {
+                playerGroup.position.set(0, 5, PLAYER_Z);
+                invulnTimer = 2.0;
+            }
+            updateHUD();
+        }
+
+        function spawnParticles(pos, isCyan, count) {
+            const mat = isCyan ? mats.partP : mats.partE;
+            if (particles.length > 100) { worldRoot.remove(particles[0].mesh); particles.shift(); }
+            for(let i=0; i<count; i++) {
+                const mesh = new THREE.Mesh(geoms.particle, mat);
+                mesh.position.copy(pos);
+                mesh.position.add(new THREE.Vector3((Math.random()-0.5)*2, (Math.random()-0.5)*2, (Math.random()-0.5)*2));
+                worldRoot.add(mesh);
+                particles.push({
+                    mesh: mesh, life: 1.0,
+                    vel: new THREE.Vector3((Math.random()-0.5)*10, (Math.random()-0.5)*10+5, (Math.random()-0.5)*10)
+                });
+            }
+        }
+
+        function updateParticles(dt) {
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.life -= dt * 2;
+                p.mesh.position.addScaledVector(p.vel, dt);
+                p.vel.y -= 9.8 * dt;
+                p.mesh.rotation.x += dt*5;
+                p.mesh.scale.setScalar(p.life);
+                if (p.life <= 0) { worldRoot.remove(p.mesh); particles.splice(i, 1); }
+            }
+        }
+
+        function getTerrainHeight(x, z, t) {
+            const zOff = z - (t * SCROLL_SPEED);
+            return (Math.sin(x * 0.3) * 2.0) + (Math.sin(zOff * 0.2) * 3.0) + (Math.cos(zOff*0.5 + x*0.5)) - 4.0;
+        }
+
+        function updateTerrain(t) {
+            const pos = terrainGeo.attributes.position;
+            const v = new THREE.Vector3();
+            for(let i=0; i<pos.count; i++){
+                v.fromBufferAttribute(pos, i);
+                v.y = getTerrainHeight(v.x, v.z, t);
+                pos.setY(i, v.y);
+            }
+            pos.needsUpdate = true;
+        }
+
+        function createHUD() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512; canvas.height = 256;
+            hudContext = canvas.getContext('2d');
+            hudTexture = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.MeshBasicMaterial({ map: hudTexture, transparent: true, depthTest: false });
+            hudMesh = new THREE.Mesh(new THREE.PlaneGeometry(15, 7.5), mat);
+            hudMesh.renderOrder = -1;
+            hudMesh.position.set(0, 2, HUD_Z);
+            hudMesh.rotation.x = -10 * Math.PI/180;
+            worldRoot.add(hudMesh);
+        }
+
+        function updateHUD() {
+            const ctx = hudContext;
+            const w = 512; const h = 256;
+            ctx.clearRect(0,0,w,h);
+            
+            ctx.fillStyle = "rgba(0,0,0,0.5)"; 
+            ctx.fillRect(0,0,w,h);
+
+            ctx.textAlign="center"; 
+            ctx.fillStyle="#0f0";
+            
+            if (gameState === "PLAYING") {
+                ctx.font="bold 40px Courier"; ctx.fillText(`LVL ${currentLevel} | SCORE ${score}`, w/2, 60);
+                ctx.fillStyle = isBossPhase ? "#f00" : "#0f0";
+                ctx.fillText(isBossPhase ? "BOSS FIGHT" : `WAVE TIME: ${Math.ceil(LEVEL_DURATION - levelTimer)}`, w/2, 120);
+                ctx.fillStyle = invulnTimer > 0 ? "#ff0" : "#0f0";
+                ctx.fillText(`LIVES: ${lives}`, w/2, 180);
+            } else if (gameState === "GAME_OVER") {
+                ctx.fillStyle="#f00"; ctx.font="bold 60px Courier"; ctx.fillText("GAME OVER", w/2, 128);
+            } else {
+                ctx.font="40px Courier"; ctx.fillText("READY", w/2, 128);
+            }
+            hudTexture.needsUpdate = true;
+        }
+    </script>
+</body>
+</html>
