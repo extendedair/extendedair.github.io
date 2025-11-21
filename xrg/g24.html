@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>TEMPESTUOUS: RELOADED</title>
+    <style>
+        /* Base styles */
+        body { 
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: #000; 
+            overflow: hidden; 
+            font-family: 'Courier New', monospace; 
+        }
+
+        /* 2D Menu UI */
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column;
+            justify-content: center; align-items: center;
+            background: rgba(0, 0, 0, 0.85); 
+            transition: opacity 0.5s; /* Smooth fade out */
+            z-index: 999;
+        }
+
+        #game-menu {
+            border: 2px solid #0f0; 
+            padding: 40px; 
+            text-align: center; color: white; 
+            background: rgba(0, 20, 0, 0.9);
+            box-shadow: 0 0 30px #0f0;
+            max-width: 500px;
+        }
+
+        h1 { color: #0f0; margin-bottom: 10px; font-size: 2.5em; text-shadow: 0 0 20px #0f0; }
+        p { margin: 10px 0; font-size: 1.2em; }
+        .highlight { color: #fff; font-weight: bold; }
+
+        /* AR Mode Class - Safe Hiding */
+        body.xr-active #ui-layer {
+            opacity: 0;
+            pointer-events: none;
+        }
+        body.xr-active {
+            background-color: transparent !important;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <div id="game-menu">
+            <h1>TEMPESTUOUS</h1>
+            <p>Stick L/R: <span class="highlight">Move</span></p>
+            <p>Triggers: <span class="highlight">Fire</span></p>
+            <p style="font-size:0.9em; color:#8f8; margin-top:20px;">
+                10 Levels. Bosses. 
+                <br><span style="color:#ff0">TAP SCREEN FOR AUDIO</span>
+            </p>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+        import { ARButton } from 'https://unpkg.com/three@0.160.0/examples/jsm/webxr/ARButton.js';
+
+        // =============================================================================
+        // 1. CONFIGURATION
+        // =============================================================================
+        
+        const WORLD_SCALE = 0.06;
+        const SCROLL_SPEED = 15.0;
+        const VIEW_TILT = 30 * (Math.PI / 180);
+        
+        const SPAWN_Z = -45;
+        const BOSS_SPAWN_Z = -55;
+        const HUD_Z = -70; 
+        const PLAYER_Z = 8;
+        const FIELD_WIDTH = 14;
+        const LEVEL_DURATION = 10; // Testing Mode
+
+        // Hit Radii (tuned for reliability)
+        const HIT_PLAYER = 1.5; // Generous hit box for player death
+        const HIT_ENEMY = 2.0;
+        const HIT_TOWER = 2.2;
+        const HIT_BOSS = 6.0;
+
+        // =============================================================================
+        // 2. ASSETS (Geometries & Materials - POOLED)
+        // =============================================================================
+        
+        const geoms = {
+            bullet: new THREE.IcosahedronGeometry(0.4, 0),
+            particle: new THREE.BoxGeometry(0.2, 0.2, 0.2),
+            tower: new THREE.CylinderGeometry(1.0, 1.0, 1, 16), // Solid Cylinder
+            // Level Enemies
+            lvl1: new THREE.OctahedronGeometry(1.5),
+            lvl2: new THREE.CylinderGeometry(1.5, 1.5, 0.5, 6),
+            lvl3: new THREE.TorusGeometry(1.0, 0.4, 8, 16),
+            lvl4: new THREE.SphereGeometry(1.5, 16, 8),
+            lvl5: new THREE.DodecahedronGeometry(1.5),
+            lvl6: new THREE.ConeGeometry(1.2, 3, 4),
+            lvl7: new THREE.CylinderGeometry(1.2, 0.5, 3, 4),
+            lvl8: new THREE.TetrahedronGeometry(1.8),
+            lvl9: new THREE.BoxGeometry(2, 1, 3),
+            lvl10: new THREE.IcosahedronGeometry(1.5, 2)
+        };
+        // Adjustments
+        geoms.lvl4.scale(1, 0.4, 1);
+        geoms.lvl7.rotateX(Math.PI/2);
+        geoms.lvl8.rotateX(-Math.PI/4);
+
+        const LEVEL_GEOMS = [
+            geoms.lvl1, geoms.lvl2, geoms.lvl3, geoms.lvl4, geoms.lvl5,
+            geoms.lvl6, geoms.lvl7, geoms.lvl8, geoms.lvl9, geoms.lvl10
+        ];
+
+        const mats = {
+            black: new THREE.MeshBasicMaterial({ color: 0x000000 }),
+            wireP: new THREE.LineBasicMaterial({ color: 0x00ffff }),
+            wireE: new THREE.LineBasicMaterial({ color: 0xff00ff }),
+            wireT: new THREE.LineBasicMaterial({ color: 0xffaa00 }),
+            wireB: new THREE.LineBasicMaterial({ color: 0xff0000, linewidth: 2 }),
+            bulP: new THREE.MeshBasicMaterial({ color: 0x00ffff }),
+            bulE: new THREE.MeshBasicMaterial({ color: 0xff0000 }),
+            partP: new THREE.MeshBasicMaterial({ color: 0x00ffff }),
+            partE: new THREE.MeshBasicMaterial({ color: 0xff00ff })
+        };
+
+        // =============================================================================
+        // 3. AUDIO SYSTEM
+        // =============================================================================
+        let audioCtx = null;
+        let noiseBuf = null;
+        let bossOsc = null, bossGain = null;
+
+        function initAudio() {
+            if(!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const size = audioCtx.sampleRate * 2;
+                noiseBuf = audioCtx.createBuffer(1, size, audioCtx.sampleRate);
+                const d = noiseBuf.getChannelData(0);
+                for(let i=0; i<size; i++) d[i] = Math.random()*2-1;
+            }
+            if(audioCtx.state === 'suspended') audioCtx.resume();
+        }
+
+        function playSfx(type) {
+            if(!audioCtx) return;
+            const t = audioCtx.currentTime;
+            const g = audioCtx.createGain();
+            g.connect(audioCtx.destination);
+
+            if(type === 'shoot') {
+                const o = audioCtx.createOscillator();
+                o.type = 'square'; o.frequency.setValueAtTime(880, t);
+                o.frequency.exponentialRampToValueAtTime(110, t+0.1);
+                o.connect(g);
+                g.gain.setValueAtTime(0.1, t); g.gain.exponentialRampToValueAtTime(0.01, t+0.1);
+                o.start(t); o.stop(t+0.1);
+            } else if(type === 'explode') {
+                const src = audioCtx.createBufferSource();
+                src.buffer = noiseBuf;
+                const f = audioCtx.createBiquadFilter();
+                f.type='lowpass'; f.frequency.value=1000;
+                src.connect(f); f.connect(g);
+                g.gain.setValueAtTime(0.5, t); g.gain.exponentialRampToValueAtTime(0.01, t+0.4);
+                src.start(t); src.stop(t+0.4);
+            } else if(type === 'bossDeath') {
+                const src = audioCtx.createBufferSource();
+                src.buffer = noiseBuf;
+                const f = audioCtx.createBiquadFilter();
+                f.type='lowpass'; f.frequency.value=600;
+                src.connect(f); f.connect(g);
+                g.gain.setValueAtTime(0.8, t); g.gain.linearRampToValueAtTime(0, t+2);
+                src.start(t); src.stop(t+2);
+            }
+        }
+
+        function toggleSiren(active) {
+            if(!audioCtx) return;
+            if(active && !bossOsc) {
+                bossOsc = audioCtx.createOscillator();
+                bossGain = audioCtx.createGain();
+                bossOsc.type = 'sawtooth';
+                bossOsc.frequency.value = 100;
+                bossOsc.connect(bossGain);
+                bossGain.connect(audioCtx.destination);
+                bossGain.gain.value = 0.05;
+                bossOsc.start();
+            } else if(!active && bossOsc) {
+                bossOsc.stop(); bossOsc.disconnect(); bossGain.disconnect(); bossOsc = null;
+            }
+        }
+
+        // =============================================================================
+        // 4. GLOBAL VARIABLES
+        // =============================================================================
+        let camera, scene, renderer, worldRoot;
+        let clock = new THREE.Clock();
+        let hudTex, hudCtx;
+
+        // Game State
+        let gameState = "WAITING";
+        let score = 0;
+        let lives = 10;
+        let level = 1;
+        let levelTime = 0;
+        let isBoss = false;
+        let invuln = 0;
+        let nextTower = 0;
+
+        // Lists
+        let player;
+        let terrainGeo;
+        const enemies = [];
+        const towers = [];
+        const bullets = [];
+        const particles = [];
+        let boss = null;
+
+        // Init
+        window.addEventListener('click', initAudio);
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 100);
+            scene.fog = new THREE.Fog(0x000000, 25, 60);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Standard AR Button setup (Safest method)
+            const arBtn = ARButton.createButton(renderer, { 
+                requiredFeatures: ['local'],
+                optionalFeatures: ['local-floor', 'bounded-floor', 'dom-overlay'],
+                domOverlay: { root: document.body } 
+            });
+            document.body.appendChild(arBtn);
+
+            renderer.xr.addEventListener('sessionstart', () => {
+                document.body.classList.add('xr-active');
+                initAudio();
+                resetGame();
+            });
+            renderer.xr.addEventListener('sessionend', () => {
+                document.body.classList.remove('xr-active');
+                toggleSiren(false);
+                location.reload();
+            });
+
+            const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1);
+            scene.add(light);
+
+            createWorld();
+            createControllers();
+            createPlayer();
+            createHUD();
+            updateHUD();
+        }
+
+        function createWorld() {
+            worldRoot = new THREE.Group();
+            worldRoot.position.set(0, -0.5, -1.5);
+            worldRoot.rotation.x = VIEW_TILT;
+            worldRoot.scale.setScalar(WORLD_SCALE);
+            scene.add(worldRoot);
+
+            terrainGeo = new THREE.PlaneGeometry(FIELD_WIDTH + 10, 80, 30, 80);
+            terrainGeo.rotateX(-Math.PI/2);
+            
+            const tSolid = new THREE.Mesh(terrainGeo, mats.black);
+            const tWire = new THREE.Mesh(terrainGeo, new THREE.MeshBasicMaterial({ 
+                color: 0x00ff00, wireframe: true, transparent: true, opacity: 0.3 
+            }));
+            worldRoot.add(tSolid);
+            worldRoot.add(tWire);
+        }
+
+        function createPlayer() {
+            player = new THREE.Group();
+            
+            // 3 Cylinders - Middle Reversed (Tapered front)
+            // CylinderGeometry(radiusTop, radiusBottom, height, segments)
+            // Rotate X 90 deg -> Top is Front, Bottom is Back
+            
+            // Middle: Pointy front (0.2), Wide back (0.6)
+            const bodyGeo = new THREE.CylinderGeometry(0.2, 0.6, 2.5, 8);
+            bodyGeo.rotateX(Math.PI/2);
+            const body = new THREE.Group();
+            body.add(new THREE.Mesh(bodyGeo, mats.black));
+            body.add(new THREE.LineSegments(new THREE.WireframeGeometry(bodyGeo), mats.wireP));
+            player.add(body);
+
+            // Side Engines
+            const engGeo = new THREE.CylinderGeometry(0.3, 0.3, 1.8, 8);
+            engGeo.rotateX(Math.PI/2);
+            [-1.4, 1.4].forEach(x => {
+                const eng = new THREE.Group();
+                eng.add(new THREE.Mesh(engGeo, mats.black));
+                eng.add(new THREE.LineSegments(new THREE.WireframeGeometry(engGeo), mats.wireP));
+                eng.position.set(x, 0, 0.5);
+                player.add(eng);
+            });
+
+            // Wing
+            const wingGeo = new THREE.BoxGeometry(3.2, 0.1, 0.8);
+            wingGeo.translate(0, 0, 0.5);
+            player.add(new THREE.LineSegments(new THREE.WireframeGeometry(wingGeo), mats.wireP));
+
+            worldRoot.add(player);
+        }
+
+        function createControllers() {
+            const c1 = renderer.xr.getController(0);
+            const c2 = renderer.xr.getController(1);
+            const act = () => {
+                if(gameState === "PLAYING") fireBullet(true, player.position);
+                else resetGame();
+            };
+            c1.addEventListener('selectstart', act);
+            c2.addEventListener('selectstart', act);
+            scene.add(c1); scene.add(c2);
+        }
+
+        // --- GAMEPLAY ---
+
+        function resetGame() {
+            // Clear
+            [...enemies, ...towers, ...bullets, ...particles].forEach(e => worldRoot.remove(e.mesh));
+            if(boss) worldRoot.remove(boss.mesh);
+            enemies.length=0; towers.length=0; bullets.length=0; particles.length=0; boss=null;
+
+            score = 0; lives = 10; level = 1;
+            startLevel(1);
+            
+            gameState = "PLAYING";
+            player.visible = true;
+            player.position.set(0, 5, PLAYER_Z);
+            invuln = 0;
+            nextTower = 0;
+            updateHUD();
+        }
+
+        function startLevel(n) {
+            level = n; levelTime = 0; isBoss = false; nextTower = 0;
+            if(boss) { worldRoot.remove(boss.mesh); boss = null; }
+            toggleSiren(false);
+            updateHUD();
+        }
+
+        function spawnBoss() {
+            if(boss) return;
+            isBoss = true; toggleSiren(true);
+            
+            const grp = new THREE.Group();
+            const idx = (level - 1) % 10;
+            const geo = LEVEL_GEOMS[idx];
+            
+            grp.add(new THREE.Mesh(geo, mats.black));
+            grp.add(new THREE.LineSegments(new THREE.WireframeGeometry(geo), mats.wireB));
+            grp.scale.setScalar(3.0);
+            grp.position.set(0, 10, BOSS_SPAWN_Z);
+            worldRoot.add(grp);
+
+            boss = { mesh: grp, hp: 20, nextFire: 0, burst: 0 };
+            updateHUD();
+        }
+
+        function spawnEnemy() {
+            const grp = new THREE.Group();
+            const idx = (level - 1) % 10;
+            const geo = LEVEL_GEOMS[idx];
+            
+            grp.add(new THREE.Mesh(geo, mats.black));
+            grp.add(new THREE.LineSegments(new THREE.WireframeGeometry(geo), mats.wireE));
+            
+            const x = (Math.random() - 0.5) * 10;
+            grp.position.set(x, 0, SPAWN_Z);
+            worldRoot.add(grp);
+            enemies.push({ mesh: grp, xBase: x, phase: Math.random()*100, nextFire: 2 });
+        }
+
+        function spawnTower() {
+            const h = 3 + Math.random() * 4;
+            const grp = new THREE.Group();
+            
+            const s = new THREE.Mesh(geoms.tower, mats.black);
+            const w = new THREE.LineSegments(new THREE.WireframeGeometry(geoms.tower), mats.wireT);
+            
+            s.scale.y = h; s.position.y = h/2;
+            w.scale.y = h; w.position.y = h/2;
+            grp.add(s); grp.add(w);
+            
+            const x = (Math.random() - 0.5) * 14;
+            const y = getTerrainHeight(x, SPAWN_Z, clock.getElapsedTime());
+            grp.position.set(x, y, SPAWN_Z);
+            
+            worldRoot.add(grp);
+            towers.push({ mesh: grp });
+        }
+
+        function fireBullet(isPlayer, pos) {
+            if(isPlayer) {
+                if(bullets.filter(b => b.isPlayer).length >= (level + 3)) return;
+                playSfx('shoot');
+            }
+
+            const m = new THREE.Mesh(geoms.bullet, isPlayer ? mats.bulP : mats.bulE);
+            m.position.copy(pos);
+            if(isPlayer) {
+                m.position.z -= 2.0; // From nose
+                spawnParts(pos, true, 5);
+            } else {
+                m.position.z += 2.0;
+            }
+            
+            worldRoot.add(m);
+            bullets.push({ 
+                mesh: m, 
+                isPlayer: isPlayer, 
+                vel: new THREE.Vector3(0, 0, isPlayer ? -45 : 25) 
+            });
+        }
+
+        // --- LOOP ---
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render() {
+            const dt = Math.min(clock.getDelta(), 0.1); // Anti-freeze cap
+            const t = clock.getElapsedTime();
+
+            handleInput(dt);
+
+            if(gameState === "PLAYING") {
+                levelTime += dt;
+                if(levelTime > LEVEL_DURATION && !isBoss) spawnBoss();
+                if(levelTime > (LEVEL_DURATION + 20)) {
+                    if(level >= 10) gameState = "COMPLETED";
+                    else startLevel(level+1);
+                }
+
+                updateTerrain(t);
+                
+                // Player Height
+                player.position.y = getTerrainHeight(player.position.x, player.position.z, t) + 4;
+
+                // Enemies
+                if(!isBoss && enemies.length < (2+level) && Math.random() < 0.02) spawnEnemy();
+                for(let i=enemies.length-1; i>=0; i--) {
+                    const e = enemies[i];
+                    e.mesh.position.z += SCROLL_SPEED * dt;
+                    e.mesh.position.x = e.xBase + Math.sin(t*2 + e.phase)*3;
+                    e.mesh.position.y = getTerrainHeight(e.mesh.position.x, e.mesh.position.z, t) + 3;
+                    
+                    if(t > e.nextFire && e.mesh.position.z < PLAYER_Z - 5) {
+                        fireBullet(false, e.mesh.position);
+                        e.nextFire = t + 2;
+                    }
+                    if(e.mesh.position.z > 15) { worldRoot.remove(e.mesh); enemies.splice(i,1); }
+                }
+
+                // Towers
+                if(!isBoss && t > nextTower && Math.random() < 0.05) {
+                    spawnTower();
+                    nextTower = t + 1.5; 
+                }
+                for(let i=towers.length-1; i>=0; i--) {
+                    const tow = towers[i];
+                    tow.mesh.position.z += SCROLL_SPEED * dt;
+                    tow.mesh.position.y = getTerrainHeight(tow.mesh.position.x, tow.mesh.position.z, t);
+                    if(tow.mesh.position.z > 15) { worldRoot.remove(tow.mesh); towers.splice(i,1); }
+                }
+
+                // Boss
+                if(boss) {
+                    const b = boss.mesh;
+                    mats.wireB.color.setHSL((t*0.2)%1, 1, 0.5);
+                    if(b.position.z < -20) b.position.z += 2 * dt;
+                    b.position.x = Math.sin(t)*6;
+                    b.position.y = getTerrainHeight(b.position.x, b.position.z, t) + 6;
+
+                    // Bullet Limit Logic
+                    const activeE = bullets.filter(b => !b.isPlayer).length;
+                    if(activeE < (level + 3)) {
+                        if(boss.burst > 0) {
+                            if(t > boss.nextFire) {
+                                fireBullet(false, b.position);
+                                boss.burst--; boss.nextFire = t + 0.3;
+                            }
+                        } else if(t > boss.nextFire) {
+                            boss.burst = 3; boss.nextFire = t;
+                        }
+                    }
+                    if(boss.burst === 0 && t > boss.nextFire) boss.nextFire = t + 1.5;
+                }
+
+                // Bullets
+                for(let i=bullets.length-1; i>=0; i--) {
+                    const b = bullets[i];
+                    b.mesh.position.addScaledVector(b.vel, dt);
+                    b.mesh.position.y = getTerrainHeight(b.mesh.position.x, b.mesh.position.z, t) + 1.5;
+                    
+                    if(b.mesh.position.z < BOSS_SPAWN_Z-10 || b.mesh.position.z > 20) {
+                        worldRoot.remove(b.mesh); bullets.splice(i,1);
+                    }
+                }
+
+                checkCollisions();
+            } else if (gameState === "COMPLETED" && levelTime > (LEVEL_DURATION + 25)) {
+                resetGame();
+            }
+
+            // Particles
+            for(let i=particles.length-1; i>=0; i--) {
+                const p = particles[i];
+                p.life -= dt * 1.5;
+                p.mesh.position.addScaledVector(p.vel, dt);
+                p.mesh.rotation.x += dt;
+                p.mesh.scale.setScalar(p.life);
+                if(p.life <= 0) { worldRoot.remove(p.mesh); particles.splice(i,1); }
+            }
+
+            // Invuln
+            if(invuln > 0) {
+                invuln -= dt;
+                player.visible = (Math.floor(t*20)%2 === 0);
+                if(invuln <= 0) { player.visible = true; updateHUD(); }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        function handleInput(dt) {
+            const s = renderer.xr.getSession();
+            let dx = 0;
+            if(s) {
+                for(const src of s.inputSources) {
+                    if(src.gamepad) {
+                        if(src.gamepad.axes.length>2) dx += src.gamepad.axes[2];
+                        if(src.gamepad.buttons[0].pressed && gameState !== "PLAYING") resetGame();
+                        else if(src.gamepad.buttons[0].pressed && gameState === "PLAYING") fireBullet(true, player.position);
+                    }
+                }
+            }
+            if(Math.abs(dx) > 0.1) player.position.x += dx * 10 * dt;
+            player.position.x = Math.max(-7, Math.min(7, player.position.x));
+            player.rotation.z = -dx * 0.5;
+        }
+
+        // --- COLLISION (DISTANCE BASED - SIMPLE & ROBUST) ---
+        function checkCollisions() {
+            if(invuln > 0 || !player.visible) return;
+
+            const pPos = player.position;
+            // Multi-point check for player to ensure wings/nose get hit
+            const pPoints = [
+                pPos,
+                new THREE.Vector3(pPos.x - 1.5, pPos.y, pPos.z),
+                new THREE.Vector3(pPos.x + 1.5, pPos.y, pPos.z),
+                new THREE.Vector3(pPos.x, pPos.y, pPos.z - 1.5)
+            ];
+
+            // 1. Crashes
+            for(const t of towers) {
+                // Player vs Tower
+                for(const pt of pPoints) {
+                    if(pt.distanceTo(t.mesh.position) < HIT_TOWER) return playerDie();
+                }
+            }
+
+            for(let i=enemies.length-1; i>=0; i--) {
+                const e = enemies[i];
+                // Enemy vs Player
+                for(const pt of pPoints) {
+                    if(pt.distanceTo(e.mesh.position) < HIT_ENEMY) {
+                        explode(e.mesh.position, false);
+                        worldRoot.remove(e.mesh); enemies.splice(i,1);
+                        return playerDie();
+                    }
+                }
+                // Enemy vs Tower
+                for(const t of towers) {
+                    if(e.mesh.position.distanceTo(t.mesh.position) < HIT_TOWER) {
+                        explode(e.mesh.position, false);
+                        worldRoot.remove(e.mesh); enemies.splice(i,1);
+                        break;
+                    }
+                }
+            }
+
+            if(boss) {
+                for(const pt of pPoints) {
+                    if(pt.distanceTo(boss.mesh.position) < HIT_BOSS) return playerDie();
+                }
+            }
+
+            // 2. Bullets
+            for(let i=bullets.length-1; i>=0; i--) {
+                const b = bullets[i];
+                let hit = false;
+
+                // Bullet vs Tower (Blocking)
+                for(const t of towers) {
+                    if(b.mesh.position.distanceTo(t.mesh.position) < HIT_TOWER) {
+                        hit = true; break;
+                    }
+                }
+
+                if(!hit) {
+                    if(b.isPlayer) {
+                        // vs Enemies
+                        for(let j=enemies.length-1; j>=0; j--) {
+                            if(b.mesh.position.distanceTo(enemies[j].mesh.position) < HIT_ENEMY) {
+                                explode(enemies[j].mesh.position, false);
+                                worldRoot.remove(enemies[j].mesh); enemies.splice(j,1);
+                                score += 10; updateHUD(); hit = true; break;
+                            }
+                        }
+                        // vs Boss
+                        if(!hit && boss && b.mesh.position.distanceTo(boss.mesh.position) < HIT_BOSS) {
+                            spawnParts(b.mesh.position, false, 5);
+                            playSfx('explode');
+                            boss.hp--;
+                            if(boss.hp <= 0) {
+                                playSfx('bossDeath');
+                                explode(boss.mesh.position, false, 50);
+                                worldRoot.remove(boss.mesh); boss = null;
+                                toggleSiren(false);
+                                score += level*100;
+                                if(level >= 10) {
+                                    gameState = "COMPLETED";
+                                    updateHUD();
+                                } else {
+                                    startLevel(level+1);
+                                }
+                            }
+                            hit = true;
+                        }
+                    } else {
+                        // Enemy Bullet vs Player
+                        // Check against all player points for accuracy
+                        for(const pt of pPoints) {
+                            if(b.mesh.position.distanceTo(pt) < HIT_PLAYER) {
+                                playerDie();
+                                hit = true; break;
+                            }
+                        }
+                    }
+                }
+
+                if(hit) {
+                    worldRoot.remove(b.mesh);
+                    bullets.splice(i,1);
+                }
+            }
+        }
+
+        function playerDie() {
+            explode(player.position, true);
+            lives--;
+            player.visible = false;
+            
+            // Safe Zone
+            towers.forEach(t => { if(t.mesh.position.z > PLAYER_Z-15) t.mesh.position.z = -200; });
+            enemies.forEach(e => { if(e.mesh.position.z > PLAYER_Z-15) e.mesh.position.z = -200; });
+            bullets.forEach(b => worldRoot.remove(b.mesh));
+            bullets.length = 0;
+
+            if(lives <= 0) { gameState = "GAME_OVER"; toggleSiren(false); }
+            else {
+                player.position.set(0, 5, PLAYER_Z);
+                invuln = 2.0;
+            }
+            updateHUD();
+        }
+
+        function explode(pos, isPlayer, amt=15) {
+            playSfx('explode');
+            spawnParts(pos, isPlayer, amt);
+        }
+
+        function spawnParts(pos, isCyan, count) {
+            const mat = isCyan ? mats.partP : mats.partE;
+            // Pool limit
+            if(particles.length > 150) { worldRoot.remove(particles[0].mesh); particles.shift(); }
+            for(let i=0; i<count; i++) {
+                const m = new THREE.Mesh(geoms.particle, mat);
+                m.position.copy(pos);
+                m.position.add(new THREE.Vector3((Math.random()-0.5)*2, (Math.random()-0.5)*2, (Math.random()-0.5)*2));
+                worldRoot.add(m);
+                particles.push({ mesh: m, life: 1.0, vel: new THREE.Vector3((Math.random()-0.5)*10, (Math.random()-0.5)*10+5, (Math.random()-0.5)*10) });
+            }
+        }
+
+        function getTerrainHeight(x, z, t) {
+            const zOff = z - (t * SCROLL_SPEED);
+            return (Math.sin(x * 0.3) * 2.0) + (Math.sin(zOff * 0.2) * 3.0) + (Math.cos(zOff*0.5 + x*0.5)) - 4.0;
+        }
+
+        function updateTerrain(t) {
+            const pos = terrainGeo.attributes.position;
+            const v = new THREE.Vector3();
+            for(let i=0; i<pos.count; i++){
+                v.fromBufferAttribute(pos, i);
+                v.y = getTerrainHeight(v.x, v.z, t);
+                pos.setY(i, v.y);
+            }
+            pos.needsUpdate = true;
+        }
+
+        function createHUD() {
+            const c = document.createElement('canvas');
+            c.width = 512; c.height = 256;
+            hudContext = c.getContext('2d');
+            hudTexture = new THREE.CanvasTexture(c);
+            const mat = new THREE.MeshBasicMaterial({ map: hudTexture, transparent: true, depthTest: false });
+            hudMesh = new THREE.Mesh(new THREE.PlaneGeometry(15, 7.5), mat);
+            hudMesh.renderOrder = -1;
+            hudMesh.position.set(0, 2, HUD_Z);
+            hudMesh.rotation.x = -10 * Math.PI/180;
+            worldRoot.add(hudMesh);
+        }
+
+        function updateHUD() {
+            const ctx = hudContext;
+            ctx.clearRect(0,0,512,256);
+            ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillRect(0,0,512,256);
+            ctx.textAlign="center"; ctx.fillStyle="#0f0";
+            
+            if (gameState === "PLAYING") {
+                ctx.font="bold 40px Courier"; ctx.fillText(`LVL ${level} | SCORE ${score}`, 256, 60);
+                ctx.fillStyle = isBoss ? "#f00" : "#0f0";
+                ctx.fillText(isBoss ? "BOSS BATTLE" : `TIME: ${Math.ceil(LEVEL_DURATION - levelTime)}`, 256, 120);
+                ctx.fillStyle = invuln > 0 ? "#ff0" : "#0f0";
+                ctx.fillText(`LIVES: ${lives}`, 256, 180);
+            } else if (gameState === "GAME_OVER") {
+                ctx.fillStyle="#f00"; ctx.font="bold 60px Courier"; ctx.fillText("GAME OVER", 256, 128);
+            } else if (gameState === "COMPLETED") {
+                ctx.fillStyle="#0ff"; ctx.font="bold 40px Courier"; 
+                ctx.fillText("COMPLETED!", 256, 100); ctx.fillText("RESTARTING...", 256, 150);
+            } else {
+                ctx.font="40px Courier"; ctx.fillText("PULL TRIGGER", 256, 128);
+            }
+            hudTexture.needsUpdate = true;
+        }
+    </script>
+</body>
+</html>
