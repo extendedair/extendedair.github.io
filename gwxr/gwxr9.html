@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Enemies on Surface</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+    </style>
+</head>
+<body>
+
+    <!-- Load Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let levelMesh;
+        const enemies = [];
+
+        // Sausage Dimensions
+        const CAPSULE_RADIUS = 0.15;
+        const CAPSULE_LENGTH = 0.4; // Length of the cylindrical part
+
+        init();
+
+        function init() {
+            // 1. Scene Setup
+            scene = new THREE.Scene();
+            scene.background = null;
+
+            // 2. Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 3. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. AR Button
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            // 5. Lighting
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // 6. Create Level & Enemies
+            createLevel();
+
+            // 7. Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        function createLevel() {
+            const group = new THREE.Group();
+
+            // --- A. The Sausage (Level) ---
+            const geometry = new THREE.CapsuleGeometry(CAPSULE_RADIUS, CAPSULE_LENGTH, 4, 8);
+            
+            // Solid Mesh (Blue)
+            const material = new THREE.MeshPhongMaterial({ 
+                color: 0x0044ff,
+                shininess: 30,
+                flatShading: true,
+                polygonOffset: true,
+                polygonOffsetFactor: 1, 
+                polygonOffsetUnits: 1
+            });
+            levelMesh = new THREE.Mesh(geometry, material);
+
+            // Wireframe Overlay (White)
+            const wireGeo = new THREE.WireframeGeometry(geometry);
+            const wireMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+            const wireMesh = new THREE.LineSegments(wireGeo, wireMat);
+            levelMesh.add(wireMesh);
+            
+            group.add(levelMesh);
+            
+            // Position 1 meter in front
+            group.position.set(0, 0, -1);
+            scene.add(group);
+
+            // --- B. Create 3 Enemies ---
+            for (let i = 0; i < 3; i++) {
+                createEnemy();
+            }
+        }
+
+        function createEnemy() {
+            // Enemy Visuals: Red Octahedron + Wireframe
+            const geo = new THREE.OctahedronGeometry(0.03); // Small size
+            const mat = new THREE.MeshPhongMaterial({ 
+                color: 0xFF0055, // Red/Pink
+                flatShading: true,
+                polygonOffset: true,
+                polygonOffsetFactor: 1
+            });
+            const mesh = new THREE.Mesh(geo, mat);
+
+            // Enemy Wireframe
+            const wGeo = new THREE.WireframeGeometry(geo);
+            const wMat = new THREE.LineBasicMaterial({ color: 0xffffff });
+            mesh.add(new THREE.LineSegments(wGeo, wMat));
+
+            // Add to Level Mesh (So they move relative to the sausage)
+            levelMesh.add(mesh);
+
+            // Initial Position (Random on surface approximation)
+            const randomPos = new THREE.Vector3(
+                Math.random()-0.5, 
+                Math.random()-0.5, 
+                Math.random()-0.5
+            ).normalize().multiplyScalar(CAPSULE_RADIUS + 0.1);
+            
+            mesh.position.copy(randomPos);
+            snapToCapsuleSurface(mesh);
+
+            // Store Entity Data
+            enemies.push({
+                mesh: mesh,
+                // Random movement vector
+                velocity: new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize().multiplyScalar(0.005)
+            });
+        }
+
+        function snapToCapsuleSurface(mesh) {
+            // Math to snap a point to a Capsule Surface
+            // 1. Find nearest point on the central line segment
+            const halfLen = CAPSULE_LENGTH / 2;
+            const p = mesh.position;
+
+            // Clamps Y to the cylinder segment
+            const clampedY = Math.max(-halfLen, Math.min(halfLen, p.y));
+            
+            // The nearest point on the central axis
+            const centerPoint = new THREE.Vector3(0, clampedY, 0);
+            
+            // 2. Vector from center axis to current position
+            const dir = new THREE.Vector3().subVectors(p, centerPoint).normalize();
+            
+            // 3. New position = centerPoint + direction * Radius
+            // We add a tiny offset (0.015) so the enemy sits ON TOP of the surface, not half-in
+            mesh.position.copy(centerPoint).add(dir.multiplyScalar(CAPSULE_RADIUS + 0.03));
+            
+            // 4. Orient enemy to face outward (Normal)
+            const up = new THREE.Vector3(0, 1, 0);
+            const q = new THREE.Quaternion().setFromUnitVectors(up, dir);
+            mesh.quaternion.slerp(q, 1.0); // Instant rotation
+        }
+
+        function render() {
+            // 1. Rotate the whole world slowly (Visual effect)
+            if (levelMesh) {
+                levelMesh.rotation.y += 0.002;
+                levelMesh.rotation.x += 0.001;
+            }
+
+            // 2. Update Enemies
+            enemies.forEach(e => {
+                // Move in random direction
+                e.mesh.position.add(e.velocity);
+                
+                // Slowly change direction for "wandering" feel
+                if (Math.random() < 0.05) {
+                    e.velocity.x += (Math.random()-0.5) * 0.001;
+                    e.velocity.y += (Math.random()-0.5) * 0.001;
+                    e.velocity.z += (Math.random()-0.5) * 0.001;
+                    e.velocity.normalize().multiplyScalar(0.005); // Maintain speed
+                }
+
+                // Snap back to surface
+                snapToCapsuleSurface(e.mesh);
+            });
+            
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
