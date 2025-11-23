@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Rolling Mechanic</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+        #overlay {
+            position: absolute; bottom: 20px; width: 100%; 
+            text-align: center; color: #0ff; font-family: monospace;
+            pointer-events: none; text-shadow: 1px 1px 0 #000;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">Left Stick UP/DOWN: Roll World</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let worldGroup; // Container for the game
+        let levelMesh;  // The rotating sausage
+        let playerMesh; // The static ship
+        
+        // Config
+        const CAPSULE_RADIUS = 0.15;
+        const CAPSULE_LENGTH = 0.4;
+
+        init();
+
+        function init() {
+            // 1. Scene
+            scene = new THREE.Scene();
+            scene.background = null;
+
+            // 2. Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 3. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. AR Button
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            // 5. Lights
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // 6. Build World
+            buildGameWorld();
+
+            // 7. Controllers (for Input)
+            const controller1 = renderer.xr.getController(0);
+            scene.add(controller1);
+
+            // 8. Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        function buildGameWorld() {
+            // Group holding everything, positioned 1m in front
+            worldGroup = new THREE.Group();
+            worldGroup.position.set(0, 0, -1);
+            scene.add(worldGroup);
+
+            // --- 1. The Sausage (Level) ---
+            const geometry = new THREE.CapsuleGeometry(CAPSULE_RADIUS, CAPSULE_LENGTH, 4, 8);
+            
+            // Material: Blue Cell-shaded
+            const material = new THREE.MeshPhongMaterial({ 
+                color: 0x0044ff,
+                shininess: 30,
+                flatShading: true,
+                polygonOffset: true,
+                polygonOffsetFactor: 1, 
+                polygonOffsetUnits: 1
+            });
+            levelMesh = new THREE.Mesh(geometry, material);
+
+            // Wireframe
+            const wireGeo = new THREE.WireframeGeometry(geometry);
+            const wireMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+            levelMesh.add(new THREE.LineSegments(wireGeo, wireMat));
+
+            // Orient Horizontal: Rotate 90 deg around Z axis
+            // Default capsule is Vertical (Y-Axis). Rotating Z makes it Horizontal (X-Axis).
+            levelMesh.rotation.z = Math.PI / 2;
+
+            worldGroup.add(levelMesh);
+
+
+            // --- 2. The Player (Static) ---
+            // We add the player to worldGroup (NOT levelMesh)
+            // This ensures the player stays still while levelMesh spins.
+            const pGeo = new THREE.ConeGeometry(0.015, 0.04, 16);
+            // Rotate cone to point "Up" relative to the surface (which is Z-forward in group space)
+            pGeo.rotateX(Math.PI / 2); 
+            
+            const pMat = new THREE.MeshBasicMaterial({ color: 0x00FFFF });
+            playerMesh = new THREE.Mesh(pGeo, pMat);
+
+            // Position: Center (X=0, Y=0) but pulled forward by Radius (Z)
+            // We add a small offset (0.02) so it hovers slightly
+            playerMesh.position.set(0, 0, CAPSULE_RADIUS + 0.02);
+
+            worldGroup.add(playerMesh);
+        }
+
+        function render() {
+            const dt = 0.016;
+
+            // --- Input Handling ---
+            const session = renderer.xr.getSession();
+            let inputY = 0; // Up/Down
+
+            if (session) {
+                for (const source of session.inputSources) {
+                    if (source.handedness === 'left' && source.gamepad) {
+                        // Axis 3 is usually the Y-axis of the thumbstick
+                        if (source.gamepad.axes.length >= 4) {
+                            inputY = source.gamepad.axes[3];
+                        }
+                    }
+                }
+            }
+
+            // --- Rolling Mechanic ---
+            // If stick is moved Up/Down
+            if (Math.abs(inputY) > 0.1) {
+                const rotSpeed = 2.0; // Rads per second
+                
+                // We rotate the levelMesh around the X-axis (World X, which is Local X for the group)
+                // Since the mesh geometry was rotated Z to lie flat, its local axes are different,
+                // but we can simply rotate on the World Axis X.
+                
+                // Note: InputY Up is usually negative, Down is positive.
+                // If we push Stick Up (Negative), we want to move "Forward".
+                // Walking forward on a treadmill makes the treadmill spin backwards (Top moves towards you).
+                // Let's try direct mapping:
+                
+                levelMesh.rotateOnWorldAxis(new THREE.Vector3(1, 0, 0), inputY * rotSpeed * dt);
+            }
+
+            renderer.render(scene, camera);
+        }
+
+    </script>
+</body>
+</html>
