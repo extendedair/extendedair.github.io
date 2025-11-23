@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Dual Axis Movement</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+        #overlay {
+            position: absolute; bottom: 20px; width: 100%; 
+            text-align: center; color: #0ff; font-family: monospace;
+            pointer-events: none; text-shadow: 1px 1px 0 #000;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">Left Stick: Move (Roll & Spin World)</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let worldGroup; // Container for game content
+        let levelMesh;  // The rotating world
+        let playerMesh; // The static player
+        
+        // Dimensions
+        const CAPSULE_RADIUS = 0.15;
+        const CAPSULE_LENGTH = 0.4;
+
+        init();
+
+        function init() {
+            // 1. Scene
+            scene = new THREE.Scene();
+            scene.background = null;
+
+            // 2. Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 3. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. AR Button
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            // 5. Lights
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // 6. Build Game Objects
+            buildGameWorld();
+
+            // 7. Controllers (Input)
+            const controller1 = renderer.xr.getController(0);
+            scene.add(controller1);
+
+            // 8. Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        function buildGameWorld() {
+            // Root container positioned 1m in front
+            worldGroup = new THREE.Group();
+            worldGroup.position.set(0, 0, -1);
+            scene.add(worldGroup);
+
+            // --- 1. The Sausage (Level) ---
+            const geometry = new THREE.CapsuleGeometry(CAPSULE_RADIUS, CAPSULE_LENGTH, 4, 8);
+            
+            // Material: Blue, Flat Shaded
+            const material = new THREE.MeshPhongMaterial({ 
+                color: 0x0044ff,
+                shininess: 30,
+                flatShading: true,
+                polygonOffset: true,
+                polygonOffsetFactor: 1, 
+                polygonOffsetUnits: 1
+            });
+            levelMesh = new THREE.Mesh(geometry, material);
+
+            // Wireframe
+            const wireGeo = new THREE.WireframeGeometry(geometry);
+            const wireMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+            levelMesh.add(new THREE.LineSegments(wireGeo, wireMat));
+
+            // Orientation: Rotate Z to lay horizontal
+            levelMesh.rotation.z = Math.PI / 2;
+
+            worldGroup.add(levelMesh);
+
+
+            // --- 2. The Player (Static Flattened Sphere) ---
+            // Sphere radius 0.02
+            const pGeo = new THREE.SphereGeometry(0.02, 16, 16);
+            // Flatten it on local Y axis to look like a disc/saucer
+            pGeo.scale(1, 0.4, 1);
+            
+            const pMat = new THREE.MeshBasicMaterial({ color: 0x00FFFF });
+            playerMesh = new THREE.Mesh(pGeo, pMat);
+
+            // Position: Center (X=0, Y=0) pushed forward in Z to sit on surface
+            // We add a tiny offset (0.01) so it doesn't clip inside
+            playerMesh.position.set(0, 0, CAPSULE_RADIUS + 0.01);
+            
+            // Rotate it 90deg X so the top of the saucer faces the camera
+            playerMesh.rotation.x = Math.PI / 2;
+
+            worldGroup.add(playerMesh);
+        }
+
+        function render() {
+            const dt = 0.016; // Approx delta time
+
+            // --- Input Handling ---
+            const session = renderer.xr.getSession();
+            let inputX = 0; // Left/Right
+            let inputY = 0; // Up/Down
+
+            if (session) {
+                for (const source of session.inputSources) {
+                    if (source.handedness === 'left' && source.gamepad) {
+                        const gp = source.gamepad;
+                        if (gp.axes.length >= 4) {
+                            inputX = gp.axes[2];
+                            inputY = gp.axes[3];
+                        }
+                    }
+                }
+            }
+
+            // --- Dual Axis Rotation Logic ---
+            // We rotate the levelMesh based on input.
+            // 1. Up/Down Input (Y) -> Rotates around World X Axis (Rolling the log)
+            // 2. Left/Right Input (X) -> Rotates around World Y Axis (Spinning the log like a turntable)
+            
+            const moveSpeed = 2.0; // Radians per second
+
+            if (Math.abs(inputX) > 0.1 || Math.abs(inputY) > 0.1) {
+                
+                // Rotate X (Pitch)
+                if (Math.abs(inputY) > 0.1) {
+                    // InputY Up is negative -> We want to move "Forward", which means world rotates towards us (Positive X rotation)
+                    levelMesh.rotateOnWorldAxis(new THREE.Vector3(1, 0, 0), inputY * moveSpeed * dt);
+                }
+
+                // Rotate Y (Yaw)
+                if (Math.abs(inputX) > 0.1) {
+                    // InputX Right is positive -> We want to move "Right", which means world rotates Left (Negative Y rotation)
+                    // Or positive? Let's match the feel.
+                    // Pushing Stick Right usually rotates view right (world moves left).
+                    levelMesh.rotateOnWorldAxis(new THREE.Vector3(0, 1, 0), inputX * moveSpeed * dt);
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
