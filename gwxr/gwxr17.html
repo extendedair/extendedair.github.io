@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Sphere with Enemies</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+        #overlay {
+            position: absolute; bottom: 20px; width: 100%; 
+            text-align: center; color: #0ff; font-family: monospace;
+            pointer-events: none; text-shadow: 1px 1px 0 #000;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">Left Stick: Rotate Sphere | Enemies: Tracking</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let worldGroup;  
+        let levelSphere; 
+        let playerMesh;  
+        
+        const enemies = []; // Array to store enemy data
+
+        // Config
+        // Previous radius was 0.25. Increased by 30% -> 0.325
+        const SPHERE_RADIUS = 0.325;
+
+        init();
+
+        function init() {
+            // 1. Scene
+            scene = new THREE.Scene();
+            scene.background = null;
+
+            // 2. Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 3. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. AR Button
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            // 5. Lights
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // 6. Create Objects
+            buildGameWorld();
+
+            // 7. Controllers
+            const controller1 = renderer.xr.getController(0);
+            scene.add(controller1);
+
+            // 8. Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        // Helper to create a flattened sphere ship
+        function createShipMesh(color) {
+            const geo = new THREE.SphereGeometry(0.02, 16, 16);
+            geo.scale(1, 0.4, 1); // Flatten Y
+            const mat = new THREE.MeshBasicMaterial({ color: color });
+            const mesh = new THREE.Mesh(geo, mat);
+            
+            // Visual orientation:
+            // The geometry is flattened on Y.
+            // We want the "Top" (Y) to point away from the surface.
+            // We usually rotate X 90 degrees so local Z points up, but let's handle orientation in update logic.
+            return mesh;
+        }
+
+        function buildGameWorld() {
+            worldGroup = new THREE.Group();
+            worldGroup.position.set(0, 0, -1);
+            scene.add(worldGroup);
+
+            // --- 1. The Level (Death Star Style Sphere) ---
+            levelSphere = new THREE.Group();
+
+            // A. Main Sphere Body
+            const geometry = new THREE.SphereGeometry(SPHERE_RADIUS, 32, 32);
+            const material = new THREE.MeshPhongMaterial({ 
+                color: 0x888888, // Grey
+                shininess: 10,
+                flatShading: false,
+                polygonOffset: true,
+                polygonOffsetFactor: 1, 
+                polygonOffsetUnits: 1
+            });
+            const mainMesh = new THREE.Mesh(geometry, material);
+            
+            // Wireframe Overlay
+            const wireGeo = new THREE.WireframeGeometry(geometry);
+            const wireMat = new THREE.LineBasicMaterial({ color: 0x444444, linewidth: 1 });
+            mainMesh.add(new THREE.LineSegments(wireGeo, wireMat));
+            
+            levelSphere.add(mainMesh);
+
+            // B. Equator Trench
+            const eqGeo = new THREE.TorusGeometry(SPHERE_RADIUS, 0.005, 16, 64);
+            const eqMat = new THREE.MeshBasicMaterial({ color: 0x222222 });
+            const equator = new THREE.Mesh(eqGeo, eqMat);
+            equator.rotation.x = Math.PI / 2;
+            levelSphere.add(equator);
+
+            // C. The Dish
+            const dishGeo = new THREE.CircleGeometry(0.08, 32); // Slightly bigger dish for bigger sphere
+            const dishMat = new THREE.MeshBasicMaterial({ color: 0x444444, side: THREE.DoubleSide });
+            const dish = new THREE.Mesh(dishGeo, dishMat);
+            const dishPos = new THREE.Vector3(0, 0.6, 0.5).normalize().multiplyScalar(SPHERE_RADIUS + 0.002);
+            dish.position.copy(dishPos);
+            dish.lookAt(0,0,0);
+            const dishRim = new THREE.Mesh(new THREE.TorusGeometry(0.08, 0.003, 16, 32), new THREE.MeshBasicMaterial({ color: 0x000000 }));
+            dish.add(dishRim);
+            levelSphere.add(dish);
+
+            worldGroup.add(levelSphere);
+
+
+            // --- 2. The Player (Static Ship) ---
+            playerMesh = createShipMesh(0x00FFFF); // Cyan
+            // Position: Fixed at Radius + Offset
+            playerMesh.position.set(0, 0, SPHERE_RADIUS + 0.015);
+            // Rotate to face camera (Flattened side facing user)
+            playerMesh.rotation.x = Math.PI / 2;
+            worldGroup.add(playerMesh);
+
+
+            // --- 3. The Enemies (Moving Ships) ---
+            for (let i = 0; i < 3; i++) {
+                createEnemy();
+            }
+        }
+
+        function createEnemy() {
+            const mesh = createShipMesh(0xFF4400); // Orange/Red
+            
+            // Add to Level Sphere (So they rotate with the world)
+            levelSphere.add(mesh);
+
+            // Random Start Position
+            const pos = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5);
+            pos.normalize().multiplyScalar(SPHERE_RADIUS + 0.015);
+            mesh.position.copy(pos);
+
+            // Random Start Velocity (Tangent to surface)
+            // 1. Get Normal
+            const normal = pos.clone().normalize();
+            // 2. Random Vector
+            const rnd = new THREE.Vector3(Math.random(), Math.random(), Math.random());
+            // 3. Cross product to get tangent
+            const tangent = new THREE.Vector3().crossVectors(normal, rnd).normalize();
+            
+            // Speed: Mid speed (approx 0.2 units per second)
+            const velocity = tangent.multiplyScalar(0.2);
+
+            enemies.push({
+                mesh: mesh,
+                velocity: velocity
+            });
+        }
+
+        function updateEnemies(dt) {
+            enemies.forEach(e => {
+                // 1. Move
+                e.mesh.position.addScaledVector(e.velocity, dt);
+
+                // 2. Snap to Surface (Normalize length)
+                e.mesh.position.normalize().multiplyScalar(SPHERE_RADIUS + 0.015);
+
+                // 3. Adjust Velocity to stay Tangent
+                // After snapping, the old velocity might point slightly off-surface.
+                // Project velocity onto the new tangent plane.
+                const normal = e.mesh.position.clone().normalize();
+                // Project: v = v - (v . n) * n
+                const dot = e.velocity.dot(normal);
+                e.velocity.sub(normal.multiplyScalar(dot));
+                
+                // Re-normalize speed (to keep constant speed)
+                e.velocity.normalize().multiplyScalar(0.2);
+
+                // 4. Random Steering (Wander)
+                // Add a tiny random vector to velocity, then re-normalize
+                if (Math.random() < 0.1) {
+                    const noise = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).multiplyScalar(0.1);
+                    e.velocity.add(noise);
+                    e.velocity.normalize().multiplyScalar(0.2);
+                }
+
+                // 5. Orient Ship
+                // We want the Flattened Sphere (Saucer) 'Top' (Local Y) to point along Normal
+                // And we want it to 'Face' forward (Local Z? or X?)
+                // createShipMesh makes a sphere flattened on Y.
+                
+                const up = new THREE.Vector3(0, 1, 0);
+                const targetUp = normal; // Surface normal
+                
+                // Create quaternion to align Up
+                const qUp = new THREE.Quaternion().setFromUnitVectors(up, targetUp);
+                e.mesh.quaternion.copy(qUp);
+                
+                // Now rotate around the Up vector to face velocity
+                // (Simple LookAt logic is tricky with pre-rotation, so let's just Align Y to Normal is usually enough for saucers)
+                // But to make it look like it's flying "forward", we might need banking.
+                // For simple saucers, just aligning to surface is usually fine visually.
+            });
+        }
+
+        function render() {
+            const dt = 0.016;
+
+            // --- Input ---
+            const session = renderer.xr.getSession();
+            let inputX = 0; 
+            let inputY = 0; 
+
+            if (session) {
+                for (const source of session.inputSources) {
+                    if (source.handedness === 'left' && source.gamepad) {
+                        const gp = source.gamepad;
+                        if (gp.axes.length >= 4) {
+                            inputX = gp.axes[2];
+                            inputY = gp.axes[3];
+                        }
+                    }
+                }
+            }
+
+            // --- Rotation ---
+            const rotSpeed = 2.0 * dt;
+            if (Math.abs(inputX) > 0.1 || Math.abs(inputY) > 0.1) {
+                if (Math.abs(inputY) > 0.1) {
+                    levelSphere.rotateOnWorldAxis(new THREE.Vector3(1, 0, 0), inputY * rotSpeed);
+                }
+                if (Math.abs(inputX) > 0.1) {
+                    levelSphere.rotateOnWorldAxis(new THREE.Vector3(0, 1, 0), inputX * rotSpeed);
+                }
+            }
+
+            // --- Update Enemies ---
+            updateEnemies(dt);
+
+            renderer.render(scene, camera);
+        }
+
+    </script>
+</body>
+</html>
