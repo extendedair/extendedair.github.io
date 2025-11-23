@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Quest 3 MR Shooter</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; }
+    </style>
+</head>
+<body>
+    <!-- Three.js Import -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+        // ============================================================================
+        // CONFIG & STATE
+        // ============================================================================
+        const CONFIG = {
+            distance: 1.0, // Distance in meters
+            colors: {
+                player: 0x00FFFF,
+                enemy: 0xFF0044,
+                boss: 0xFFA500,
+                bullet: 0xFFFF00,
+                text: 0x00FF00
+            }
+        };
+
+        const STATE = { MENU: 0, PLAYING: 1, GAMEOVER: 2 };
+        let currentState = STATE.MENU;
+
+        // Systems
+        let camera, scene, renderer;
+        let controller1, controller2;
+        let raycaster = new THREE.Raycaster();
+        
+        // Game Objects
+        let gameRoot;       // The container that gets positioned in the room
+        let worldShape;     // The rotating level shape
+        let playerCursor;   // The visual ship
+        let uiMesh;         // Floating text
+        
+        // Gameplay Variables
+        let score = 0;
+        let lives = 3;
+        let level = 1;
+        let levelTimer = 10;
+        
+        // Entity Lists
+        let bullets = [];
+        let enemies = [];
+        let enemyBullets = [];
+        let particles = [];
+
+        // Input
+        const input = { move: new THREE.Vector2(), shoot: new THREE.Vector2(), trigger: false };
+
+        // Audio Context (Initialized on first interaction)
+        let audioCtx; 
+
+        // ============================================================================
+        // INITIALIZATION
+        // ============================================================================
+        init();
+
+        function init() {
+            scene = new THREE.Scene();
+            // CRITICAL: Background must be null for AR Passthrough
+            scene.background = null; 
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Setup AR Button
+            const arBtn = ARButton.createButton(renderer, { 
+                requiredFeatures: ['local-floor', 'hit-test'],
+                optionalFeatures: ['dom-overlay'],
+                domOverlay: { root: document.body } 
+            });
+            document.body.appendChild(arBtn);
+
+            // Lighting
+            const light = new THREE.DirectionalLight(0xffffff, 2);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // Game Root - This holds the entire game world
+            // We initialize it visible but empty
+            gameRoot = new THREE.Group();
+            scene.add(gameRoot);
+
+            // Player Cursor (The Ship)
+            // It lives in the scene (not gameRoot) so it aligns with the camera's view of the object
+            // but we will manually position it.
+            const pGeo = new THREE.ConeGeometry(0.01, 0.04, 16);
+            pGeo.rotateX(Math.PI/2);
+            const pMat = new THREE.MeshBasicMaterial({ color: CONFIG.colors.player });
+            playerCursor = new THREE.Mesh(pGeo, pMat);
+            scene.add(playerCursor);
+
+            // UI Label (Floating Text)
+            // Attached to camera initially so user sees it immediately
+            createUI();
+            
+            // Controllers
+            setupControllers();
+
+            // Start Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        function setupControllers() {
+            const controllerModelFactory = new XRControllerModelFactory();
+
+            // Controller 0 (Left)
+            controller1 = renderer.xr.getController(0);
+            const grip1 = renderer.xr.getControllerGrip(0);
+            grip1.add(controllerModelFactory.createControllerModel(grip1));
+            scene.add(grip1);
+            scene.add(controller1);
+
+            // Controller 1 (Right)
+            controller2 = renderer.xr.getController(1);
+            const grip2 = renderer.xr.getControllerGrip(1);
+            grip2.add(controllerModelFactory.createControllerModel(grip2));
+            scene.add(grip2);
+            scene.add(controller2);
+
+            // Bind Events
+            controller2.addEventListener('selectstart', () => { input.trigger = true; });
+        }
+
+        // ============================================================================
+        // UI & HELPERS
+        // ============================================================================
+        function createUI() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512; 
+            canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            
+            // Texture
+            const texture = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.MeshBasicMaterial({ map: texture, transparent: true });
+            const geo = new THREE.PlaneGeometry(0.4, 0.2);
+            uiMesh = new THREE.Mesh(geo, mat);
+            
+            // Attach to camera at start
+            uiMesh.position.set(0, 0, -0.5);
+            camera.add(uiMesh);
+            scene.add(camera);
+
+            // Update function
+            uiMesh.userData.update = (text, subtext) => {
+                ctx.clearRect(0,0,512,256);
+                ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                ctx.fillRect(0,0,512,256);
+                
+                ctx.font = 'bold 60px Arial';
+                ctx.fillStyle = '#00FF00';
+                ctx.textAlign = 'center';
+                ctx.fillText(text, 256, 100);
+                
+                if(subtext) {
+                    ctx.font = '40px Arial';
+                    ctx.fillStyle = '#FFFFFF';
+                    ctx.fillText(subtext, 256, 180);
+                }
+                texture.needsUpdate = true;
+            };
+
+            uiMesh.userData.update("PULL TRIGGER", "TO SPAWN GAME");
+        }
+
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+
+        function playSound(type) {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            
+            if (type === 'shoot') {
+                osc.type = 'square';
+                osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(110, audioCtx.currentTime + 0.1);
+                gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.1);
+            } else if (type === 'explode') {
+                osc.type = 'sawtooth';
+                osc.frequency.setValueAtTime(100, audioCtx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(10, audioCtx.currentTime + 0.3);
+                gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.3);
+            }
+            
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+        }
+
+        // ============================================================================
+        // GAME LOGIC
+        // ============================================================================
+        function positionGameInFrontOfPlayer() {
+            // Get camera position and direction
+            const vec = new THREE.Vector3();
+            const dir = new THREE.Vector3();
+            camera.getWorldPosition(vec);
+            camera.getWorldDirection(dir);
+            
+            // Calculate target: 1 meter in front
+            // We flatten Y slightly so it doesn't tilt weirdly if looking up/down
+            dir.y = 0; 
+            dir.normalize();
+            
+            const targetPos = vec.clone().add(dir.multiplyScalar(CONFIG.distance));
+            // Lower it slightly for comfort (chest height relative to head)
+            targetPos.y -= 0.3;
+
+            gameRoot.position.copy(targetPos);
+            gameRoot.lookAt(vec); // Face the player
+        }
+
+        function buildLevel(lvl) {
+            // Clear old shape
+            if (worldShape) {
+                gameRoot.remove(worldShape);
+                worldShape.geometry.dispose();
+            }
+
+            // Create Shape based on level
+            let geo;
+            const type = (lvl - 1) % 3;
+            if (type === 0) geo = new THREE.CapsuleGeometry(0.15, 0.4, 4, 8); // Sausage
+            else if (type === 1) geo = new THREE.IcosahedronGeometry(0.25, 1); // Sphere
+            else geo = new THREE.TorusGeometry(0.2, 0.08, 16, 32); // Donut
+
+            const mat = new THREE.MeshPhongMaterial({ 
+                color: 0x111111, 
+                shininess: 100,
+                polygonOffset: true,
+                polygonOffsetFactor: 1
+            });
+            
+            worldShape = new THREE.Mesh(geo, mat);
+            
+            // Wireframe
+            const wireGeo = new THREE.WireframeGeometry(geo);
+            const wireMat = new THREE.LineBasicMaterial({ color: 0x00AAFF });
+            worldShape.add(new THREE.LineSegments(wireGeo, wireMat));
+            
+            gameRoot.add(worldShape);
+        }
+
+        function spawnEnemy(isBoss) {
+            const size = isBoss ? 0.08 : 0.03;
+            const geo = new THREE.OctahedronGeometry(size);
+            const mat = new THREE.MeshBasicMaterial({ color: isBoss ? CONFIG.colors.boss : CONFIG.colors.enemy, wireframe: true });
+            const mesh = new THREE.Mesh(geo, mat);
+            
+            // Spawn random on surface approximation
+            const dir = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
+            mesh.position.copy(dir.multiplyScalar(0.3)); 
+            
+            worldShape.add(mesh); // Child of world for easy rotation
+
+            enemies.push({
+                mesh: mesh,
+                hp: isBoss ? 10 : 1,
+                isBoss: isBoss,
+                timer: 2.0
+            });
+        }
+
+        // ============================================================================
+        // MAIN LOOP
+        // ============================================================================
+        function render() {
+            const dt = 0.016;
+
+            // 1. Input Handling
+            handleInput();
+
+            // 2. State Machine
+            if (currentState === STATE.MENU) {
+                // Wait for trigger
+                if (input.trigger) {
+                    initAudio();
+                    positionGameInFrontOfPlayer();
+                    
+                    // Detach UI from camera and attach to gameRoot so it stays in the world
+                    camera.remove(uiMesh);
+                    gameRoot.add(uiMesh);
+                    uiMesh.position.set(0, 0.5, 0); // Float above shape
+
+                    // Start Game
+                    score = 0; lives = 3; level = 1;
+                    buildLevel(1);
+                    currentState = STATE.PLAYING;
+                    input.trigger = false;
+                }
+            }
+            else if (currentState === STATE.PLAYING) {
+                
+                // UI Updates
+                uiMesh.userData.update(`SCORE: ${score}`, `LIVES: ${lives} | TIME: ${Math.ceil(levelTimer)}`);
+                
+                // Movement (Rotate World)
+                if (input.move.length() > 0.1) {
+                    const axis = new THREE.Vector3(input.move.y, -input.move.x, 0).normalize();
+                    worldShape.rotateOnWorldAxis(axis, input.move.length() * 2.0 * dt);
+                }
+
+                // Raycast Player Position
+                updatePlayerCursor();
+
+                // Shooting
+                if (input.shoot.length() > 0.3) {
+                    if (!window.cooldown) window.cooldown = 0;
+                    if (window.cooldown <= 0) {
+                        fireBullet();
+                        window.cooldown = 0.15;
+                    }
+                }
+                if (window.cooldown > 0) window.cooldown -= dt;
+
+                // Game Loop Updates
+                updateBullets(dt);
+                updateEnemies(dt);
+                updateParticles(dt);
+
+                // Spawn Enemies logic
+                if (enemies.length < level + 2 && Math.random() < 0.02) spawnEnemy(false);
+
+                // Timer
+                levelTimer -= dt;
+                if (levelTimer <= 0) {
+                    level++;
+                    levelTimer = 10;
+                    buildLevel(level);
+                    spawnEnemy(true); // Boss
+                }
+            }
+            else if (currentState === STATE.GAMEOVER) {
+                uiMesh.userData.update("GAME OVER", "PULL TRIGGER TO RETRY");
+                if (input.trigger) {
+                    score = 0; lives = 3; level = 1; levelTimer = 10;
+                    currentState = STATE.PLAYING;
+                    enemies.forEach(e => worldShape.remove(e.mesh));
+                    bullets.forEach(b => worldShape.remove(b.mesh));
+                    enemies = []; bullets = [];
+                    buildLevel(1);
+                    input.trigger = false;
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        function handleInput() {
+            input.move.set(0,0);
+            input.shoot.set(0,0);
+            input.trigger = false;
+
+            const session = renderer.xr.getSession();
+            if (!session) return;
+
+            for (const source of session.inputSources) {
+                if (!source.gamepad) continue;
+                const gp = source.gamepad;
+
+                // Left Stick
+                if (source.handedness === 'left' && gp.axes.length >= 4) {
+                    input.move.x = gp.axes[2];
+                    input.move.y = gp.axes[3];
+                }
+                // Right Stick & Trigger
+                if (source.handedness === 'right') {
+                    if (gp.axes.length >= 4) {
+                        input.shoot.x = gp.axes[2];
+                        input.shoot.y = gp.axes[3];
+                    }
+                    if (gp.buttons[0] && gp.buttons[0].pressed) {
+                        input.trigger = true;
+                    }
+                }
+            }
+        }
+
+        function updatePlayerCursor() {
+            const camPos = new THREE.Vector3();
+            const camDir = new THREE.Vector3();
+            camera.getWorldPosition(camPos);
+            camera.getWorldDirection(camDir);
+            raycaster.set(camPos, camDir);
+            
+            // Intersect with the rotating worldShape
+            const hits = raycaster.intersectObject(worldShape);
+            if (hits.length > 0) {
+                playerCursor.visible = true;
+                playerCursor.position.copy(hits[0].point);
+                
+                // Align normal
+                const n = hits[0].face.normal.clone().transformDirection(worldShape.matrixWorld);
+                playerCursor.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), n);
+            } else {
+                playerCursor.visible = false;
+            }
+        }
+
+        function fireBullet() {
+            if (!playerCursor.visible) return;
+
+            // Direction: Stick input relative to Camera, projected onto Surface
+            // Simplified: Shoot in stick direction relative to View
+            const shootDir = new THREE.Vector3(input.shoot.x, -input.shoot.y, 0);
+            shootDir.applyQuaternion(camera.quaternion).normalize();
+
+            // Transform this World Direction to Model Local Direction
+            const localDir = shootDir.transformDirection(worldShape.matrixWorld.clone().invert());
+            
+            // Player local pos
+            const localPos = worldShape.worldToLocal(playerCursor.position.clone());
+
+            const geo = new THREE.SphereGeometry(0.01);
+            const mat = new THREE.MeshBasicMaterial({ color: CONFIG.colors.bullet });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.copy(localPos);
+            worldShape.add(mesh);
+            
+            bullets.push({ mesh: mesh, vel: localDir.multiplyScalar(0.4), life: 1.5 });
+            playSound('shoot');
+        }
+
+        function updateBullets(dt) {
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                const b = bullets[i];
+                b.life -= dt;
+                b.mesh.position.addScaledVector(b.vel, dt);
+                
+                // Hit detection
+                let hit = false;
+                for (let j = enemies.length - 1; j >= 0; j--) {
+                    const e = enemies[j];
+                    if (b.mesh.position.distanceTo(e.mesh.position) < 0.05) {
+                        e.hp--;
+                        createExplosion(e.mesh.position, 5, CONFIG.colors.enemy);
+                        
+                        // Bullet destroy
+                        worldShape.remove(b.mesh);
+                        bullets.splice(i, 1);
+                        hit = true;
+
+                        // Enemy destroy
+                        if (e.hp <= 0) {
+                            createExplosion(e.mesh.position, 20, CONFIG.colors.boss);
+                            worldShape.remove(e.mesh);
+                            enemies.splice(j, 1);
+                            score += 10;
+                            playSound('explode');
+                        }
+                        break;
+                    }
+                }
+
+                if (!hit && b.life <= 0) {
+                    worldShape.remove(b.mesh);
+                    bullets.splice(i, 1);
+                }
+            }
+        }
+
+        function updateEnemies(dt) {
+            // Get player local pos for tracking
+            let playerLocal = null;
+            if (playerCursor.visible) {
+                playerLocal = worldShape.worldToLocal(playerCursor.position.clone());
+            }
+
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                const e = enemies[i];
+                if (playerLocal) {
+                    const dir = new THREE.Vector3().copy(playerLocal).sub(e.mesh.position).normalize();
+                    e.mesh.position.addScaledVector(dir, 0.1 * dt);
+                    // Keep on surface (simple normalize for spheres/convex)
+                    e.mesh.position.normalize().multiplyScalar(0.25); // snap radius
+                }
+                
+                // Hit Player
+                if (playerLocal && e.mesh.position.distanceTo(playerLocal) < 0.04) {
+                    lives--;
+                    createExplosion(playerLocal, 30, CONFIG.colors.player);
+                    worldShape.remove(e.mesh);
+                    enemies.splice(i, 1);
+                    playSound('explode');
+                    if (lives <= 0) currentState = STATE.GAMEOVER;
+                }
+            }
+        }
+
+        function createExplosion(localPos, count, color) {
+            const colObj = new THREE.Color(color);
+            for(let i=0; i<count; i++) {
+                const p = new THREE.Mesh(
+                    new THREE.BoxGeometry(0.01,0.01,0.01),
+                    new THREE.MeshBasicMaterial({ color: color })
+                );
+                p.position.copy(localPos);
+                worldShape.add(p);
+                particles.push({
+                    mesh: p,
+                    vel: new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize().multiplyScalar(0.3),
+                    life: 0.5
+                });
+            }
+        }
+
+        function updateParticles(dt) {
+            for(let i=particles.length-1; i>=0; i--) {
+                const p = particles[i];
+                p.life -= dt;
+                p.mesh.position.addScaledVector(p.vel, dt);
+                p.mesh.scale.multiplyScalar(0.9);
+                if(p.life <= 0) {
+                    worldShape.remove(p.mesh);
+                    particles.splice(i,1);
+                }
+            }
+        }
+
+    </script>
+</body>
+</html>
