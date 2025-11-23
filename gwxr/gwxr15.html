@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Raycast Lock</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+        #overlay {
+            position: absolute; bottom: 20px; width: 100%; 
+            text-align: center; color: #0ff; font-family: monospace;
+            pointer-events: none; text-shadow: 1px 1px 0 #000;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">Left Stick: Spin World (Ship Locks to Surface)</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let gameRoot;   // Stationary container
+        let rotWrapper; // Wrapper to handle rotations cleanly
+        let levelMesh;  // The Sausage
+        let playerMesh; // The Ship
+        let raycaster = new THREE.Raycaster();
+
+        // Config
+        const CAPSULE_RADIUS = 0.15;
+        const CAPSULE_LENGTH = 0.4;
+
+        init();
+
+        function init() {
+            // 1. Setup Scene (Null background for AR)
+            scene = new THREE.Scene();
+            scene.background = null;
+
+            // 2. Setup Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 3. Setup Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. AR Button
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            // 5. Lighting
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // 6. Build The World
+            buildWorld();
+
+            // 7. Add Controller (For input)
+            const controller1 = renderer.xr.getController(0);
+            scene.add(controller1);
+
+            // 8. Start Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        function buildWorld() {
+            // -- Game Root --
+            // This sits 1 meter in front of the player and DOES NOT ROTATE.
+            gameRoot = new THREE.Group();
+            gameRoot.position.set(0, 0, -1);
+            scene.add(gameRoot);
+
+            // -- Rotation Wrapper --
+            // This child rotates based on input. The sausage lives inside here.
+            rotWrapper = new THREE.Group();
+            gameRoot.add(rotWrapper);
+
+            // -- The Sausage (Level) --
+            const geometry = new THREE.CapsuleGeometry(CAPSULE_RADIUS, CAPSULE_LENGTH, 4, 8);
+            const material = new THREE.MeshPhongMaterial({ 
+                color: 0x0044ff,
+                shininess: 30,
+                flatShading: true,
+                polygonOffset: true,
+                polygonOffsetFactor: 1, 
+                polygonOffsetUnits: 1
+            });
+            levelMesh = new THREE.Mesh(geometry, material);
+
+            // Wireframe
+            const wireGeo = new THREE.WireframeGeometry(geometry);
+            const wireMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+            levelMesh.add(new THREE.LineSegments(wireGeo, wireMat));
+
+            // Lay Horizontal by default
+            levelMesh.rotation.z = Math.PI / 2;
+            
+            // Add to rotation wrapper
+            rotWrapper.add(levelMesh);
+
+            // -- The Player (Ship) --
+            // The player is a sibling of rotWrapper (Child of gameRoot).
+            // This means the player DOES NOT ROTATE when the wrapper spins.
+            const pGeo = new THREE.SphereGeometry(0.02, 16, 16);
+            pGeo.scale(1, 0.4, 1); // Flatten like a saucer
+            const pMat = new THREE.MeshBasicMaterial({ color: 0x00FFFF });
+            playerMesh = new THREE.Mesh(pGeo, pMat);
+            
+            // Initial Position (Will be updated by raycast immediately)
+            playerMesh.position.set(0, 0, 0);
+            gameRoot.add(playerMesh);
+        }
+
+        function render() {
+            const dt = 0.016;
+            
+            // --- 1. Handle Input ---
+            const session = renderer.xr.getSession();
+            let inputX = 0; 
+            let inputY = 0; 
+
+            if (session) {
+                for (const source of session.inputSources) {
+                    if (source.handedness === 'left' && source.gamepad) {
+                        const gp = source.gamepad;
+                        if (gp.axes.length >= 4) {
+                            inputX = gp.axes[2]; // Left/Right
+                            inputY = gp.axes[3]; // Up/Down
+                        }
+                    }
+                }
+            }
+
+            // --- 2. Rotate the World (rotWrapper) ---
+            // We rotate the wrapper based on inputs.
+            // Note: rotating OnWorldAxis effectively rotates it relative to the camera view 
+            // because gameRoot is axis-aligned with the start view.
+            
+            const rotSpeed = 2.0 * dt;
+
+            if (Math.abs(inputX) > 0.1 || Math.abs(inputY) > 0.1) {
+                // Stick Up/Down = Rotate X Axis (Pitch)
+                if (Math.abs(inputY) > 0.1) {
+                    rotWrapper.rotateOnWorldAxis(new THREE.Vector3(1, 0, 0), inputY * rotSpeed);
+                }
+                // Stick Left/Right = Rotate Y Axis (Yaw)
+                if (Math.abs(inputX) > 0.1) {
+                    rotWrapper.rotateOnWorldAxis(new THREE.Vector3(0, 1, 0), inputX * rotSpeed);
+                }
+            }
+
+            // --- 3. The Fix: Raycast Lock ---
+            // We want to place the player exactly where the surface is, directly in the center of view.
+            
+            // Step A: Update Matrices (Crucial for accurate Raycasting)
+            rotWrapper.updateMatrixWorld();
+
+            // Step B: Setup Ray
+            // Start: 2 meters in front of the gameRoot (towards the user)
+            // Direction: Straight back into the screen (Negative Z) relative to gameRoot
+            
+            // Local Space Ray
+            const rayOrigin = new THREE.Vector3(0, 0, 2); 
+            const rayDir = new THREE.Vector3(0, 0, -1);
+
+            // Transform Ray to World Space
+            rayOrigin.applyMatrix4(gameRoot.matrixWorld);
+            rayDir.transformDirection(gameRoot.matrixWorld).normalize();
+
+            raycaster.set(rayOrigin, rayDir);
+
+            // Step C: Intersect with the Rotating Level
+            const hits = raycaster.intersectObject(levelMesh, true);
+
+            if (hits.length > 0) {
+                const hit = hits[0];
+
+                // Step D: Place Player
+                playerMesh.visible = true;
+                playerMesh.position.copy(hit.point);
+                
+                // We need the player in Local Space of gameRoot to keep hierarchy clean
+                gameRoot.worldToLocal(playerMesh.position);
+
+                // Step E: Orient Player to Normal
+                // We calculate rotation in World Space for simplicity
+                const normalWorld = hit.face.normal.clone().transformDirection(levelMesh.matrixWorld).normalize();
+                
+                // Flattened sphere "Top" is Y-axis (local). We want Local Y to point along Normal.
+                const targetQ = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0), normalWorld);
+                
+                // Since player is child of gameRoot, we apply rotation manually:
+                // But gameRoot is effectively axis-aligned to world usually. 
+                // Let's just set World Quaternion directly:
+                const finalQ = targetQ; // World Rotation
+                
+                // However, ThreeJS doesn't let us set world rotation easily on a child.
+                // Trick: Attach to Scene, Rotate, Attach back? No, too slow.
+                // Math: child.quaternion = parent.worldInverse * targetWorld
+                const parentInv = gameRoot.quaternion.clone().invert();
+                playerMesh.quaternion.copy(parentInv.multiply(targetQ));
+                
+                // Fix visual orientation: The "Saucer" should face the camera, 
+                // so we might need to rotate it 90 degrees depending on how the sphere was scaled.
+                // Our sphere was scaled (1, 0.4, 1). Y is the short axis.
+                // So aligning Y to Normal makes the "Face" of the saucer flat on the surface.
+                // This is correct for a "hovering disc".
+
+            } else {
+                // Fallback if somehow missed (shouldn't happen with (0,0) alignment)
+                // Or if geometry has holes.
+                // Keep last position.
+            }
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
