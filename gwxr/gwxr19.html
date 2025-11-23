@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Sphere Shooter Ultimate</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+        #overlay {
+            position: absolute; bottom: 20px; width: 100%; 
+            text-align: center; color: #0ff; font-family: monospace;
+            pointer-events: none; text-shadow: 1px 1px 0 #000;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">L-Stick: Move | R-Stick: Shoot | 8 Enemies</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        // --- Globals ---
+        let camera, scene, renderer;
+        let worldGroup, levelSphere, playerMesh;
+        
+        // Game State
+        const SPHERE_RADIUS = 0.325;
+        let lives = 3;
+        let isInvulnerable = false;
+        let invulnerableTimer = 0;
+        let shotCooldown = 0;
+        
+        // Entities
+        const enemies = []; 
+        const playerBullets = [];
+        const enemyBullets = [];
+        const particles = [];
+
+        // Systems
+        const audio = new SoundManager();
+
+        init();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = null; // Passthrough
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            buildGameWorld();
+
+            // Controllers
+            scene.add(renderer.xr.getController(0));
+            scene.add(renderer.xr.getController(1));
+
+            renderer.setAnimationLoop(render);
+        }
+
+        // --- Audio System (Procedural) ---
+        function SoundManager() {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const gain = ctx.createGain();
+            gain.gain.value = 0.1; // Master volume
+            gain.connect(ctx.destination);
+
+            this.resume = () => { if(ctx.state === 'suspended') ctx.resume(); };
+
+            this.shoot = () => {
+                this.resume();
+                const osc = ctx.createOscillator();
+                const g = ctx.createGain();
+                osc.type = 'square';
+                osc.frequency.setValueAtTime(600, ctx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(100, ctx.currentTime + 0.1);
+                g.gain.setValueAtTime(0.1, ctx.currentTime);
+                g.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
+                osc.connect(g); g.connect(gain);
+                osc.start(); osc.stop(ctx.currentTime + 0.1);
+            };
+
+            this.explode = () => {
+                this.resume();
+                const bufSize = ctx.sampleRate * 0.3; // 0.3 seconds
+                const buffer = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+                const data = buffer.getChannelData(0);
+                for(let i=0; i<bufSize; i++) data[i] = Math.random() * 2 - 1;
+
+                const noise = ctx.createBufferSource();
+                noise.buffer = buffer;
+                const g = ctx.createGain();
+                // Lowpass filter for "boom"
+                const filter = ctx.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.value = 1000;
+                
+                g.gain.setValueAtTime(0.2, ctx.currentTime);
+                g.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
+                
+                noise.connect(filter); filter.connect(g); g.connect(gain);
+                noise.start();
+            };
+        }
+
+        // --- Particle System ---
+        function createExplosion(pos, color) {
+            audio.explode();
+            const geo = new THREE.BoxGeometry(0.008, 0.008, 0.008);
+            const mat = new THREE.MeshBasicMaterial({ color: color });
+            
+            for(let i=0; i<12; i++) {
+                const mesh = new THREE.Mesh(geo, mat);
+                // Position in LevelSphere space
+                mesh.position.copy(pos);
+                
+                // Random outward velocity
+                const vel = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize().multiplyScalar(0.4);
+                
+                levelSphere.add(mesh);
+                particles.push({ mesh, velocity: vel, life: 0.8 });
+            }
+        }
+
+        // --- Geometry Builders ---
+
+        function createDiamondMesh() {
+            const group = new THREE.Group();
+            // Octahedron scaled to look like a diamond
+            const geo = new THREE.OctahedronGeometry(0.03, 0); // Detail 0 = sharp octahedron
+            geo.scale(1, 1.5, 1); 
+            const mat = new THREE.MeshPhongMaterial({ color: 0xFF8800, flatShading: true });
+            const mesh = new THREE.Mesh(geo, mat);
+            // Orient so Y is "Up"
+            mesh.rotation.x = Math.PI / 2; // Point pointy end out? No, Octahedron points are Y. 
+            // We want it tall.
+            group.add(mesh);
+            
+            // Wireframe
+            const wGeo = new THREE.WireframeGeometry(geo);
+            const wMat = new THREE.LineBasicMaterial({ color: 0xFFCC00 });
+            mesh.add(new THREE.LineSegments(wGeo, wMat));
+
+            return group;
+        }
+
+        function createSaucerMesh() {
+            const group = new THREE.Group();
+            const hull = new THREE.Mesh(
+                new THREE.SphereGeometry(0.025, 32, 16).scale(1, 0.3, 1),
+                new THREE.MeshPhongMaterial({ color: 0x00FFFF })
+            );
+            group.add(hull);
+            
+            const dome = new THREE.Mesh(
+                new THREE.SphereGeometry(0.012, 16, 16).translate(0,0.01,0),
+                new THREE.MeshBasicMaterial({ color: 0x88CCFF })
+            );
+            group.add(dome);
+            return group;
+        }
+
+        function buildGameWorld() {
+            worldGroup = new THREE.Group();
+            worldGroup.position.set(0, 0, -1);
+            scene.add(worldGroup);
+
+            // 1. Level Sphere
+            levelSphere = new THREE.Group();
+            const mainMesh = new THREE.Mesh(
+                new THREE.SphereGeometry(SPHERE_RADIUS, 48, 48),
+                new THREE.MeshPhongMaterial({ color: 0x888888, shininess: 10, polygonOffset: true, polygonOffsetFactor: 1 })
+            );
+            mainMesh.add(new THREE.LineSegments(
+                new THREE.WireframeGeometry(mainMesh.geometry),
+                new THREE.LineBasicMaterial({ color: 0x444444, linewidth: 1 })
+            ));
+            levelSphere.add(mainMesh);
+            
+            // Details
+            const dish = new THREE.Mesh(new THREE.CircleGeometry(0.08, 32), new THREE.MeshBasicMaterial({ color: 0x444444, side: 2 }));
+            dish.position.set(0, 0.6, 0.5).normalize().multiplyScalar(SPHERE_RADIUS + 0.001);
+            dish.lookAt(0,0,0);
+            levelSphere.add(dish);
+
+            worldGroup.add(levelSphere);
+
+            // 2. Player
+            playerMesh = createSaucerMesh();
+            playerMesh.position.set(0, 0, SPHERE_RADIUS + 0.015);
+            playerMesh.rotation.x = Math.PI / 2;
+            worldGroup.add(playerMesh);
+
+            // 3. Enemies
+            for(let i=0; i<8; i++) spawnEnemy();
+        }
+
+        function spawnEnemy() {
+            const mesh = createDiamondMesh();
+            levelSphere.add(mesh);
+            
+            const pos = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize().multiplyScalar(SPHERE_RADIUS + 0.02);
+            mesh.position.copy(pos);
+
+            // Tangent Velocity
+            const normal = pos.clone().normalize();
+            const tangent = new THREE.Vector3().crossVectors(normal, new THREE.Vector3(Math.random(), Math.random(), Math.random())).normalize();
+
+            enemies.push({
+                mesh: mesh,
+                velocity: tangent.multiplyScalar(0.2), // Mid speed
+                bullets: [], // Track own bullets
+                shootTimer: Math.random() * 2 // Stagger shots
+            });
+        }
+
+        function spawnPlayerBullet(sx, sy) {
+            if (playerBullets.length >= 10) return; // Limit 10
+            
+            const mesh = new THREE.Mesh(
+                new THREE.SphereGeometry(0.006, 8, 8),
+                new THREE.MeshBasicMaterial({ color: 0xAAFFFF })
+            );
+            
+            // Pos
+            const worldPos = playerMesh.getWorldPosition(new THREE.Vector3());
+            levelSphere.worldToLocal(worldPos);
+            mesh.position.copy(worldPos);
+            
+            // Dir
+            const dirWorld = new THREE.Vector3(sx, -sy, 0).normalize();
+            const velLocal = dirWorld.transformDirection(levelSphere.matrixWorld.clone().invert());
+            
+            levelSphere.add(mesh);
+            playerBullets.push({ mesh, velocity: velLocal.multiplyScalar(0.6), life: 2.0 });
+            audio.shoot();
+        }
+
+        function spawnEnemyBullet(enemy) {
+            if (enemy.bullets.length >= 2) return;
+
+            const mesh = new THREE.Mesh(
+                new THREE.SphereGeometry(0.008, 8, 8),
+                new THREE.MeshBasicMaterial({ color: 0xFF0000 })
+            );
+            mesh.position.copy(enemy.mesh.position);
+
+            // Target Player
+            const pLocal = playerMesh.getWorldPosition(new THREE.Vector3());
+            levelSphere.worldToLocal(pLocal);
+            
+            // Calc direction on surface (Tangent approximation)
+            const dir = new THREE.Vector3().subVectors(pLocal, enemy.mesh.position).normalize();
+
+            levelSphere.add(mesh);
+            
+            const b = { mesh, velocity: dir.multiplyScalar(0.3), life: 3.0 };
+            enemyBullets.push(b);
+            enemy.bullets.push(b); // Reference to track count
+        }
+
+        function handlePlayerHit() {
+            if (isInvulnerable) return;
+            lives--;
+            isInvulnerable = true;
+            invulnerableTimer = 3.0;
+            audio.explode(); // Different sound?
+            if (lives <= 0) {
+                // Game Over logic (Just reset for this demo)
+                lives = 3;
+            }
+        }
+
+        function update(dt) {
+            // --- Particles ---
+            for(let i=particles.length-1; i>=0; i--) {
+                const p = particles[i];
+                p.life -= dt;
+                p.mesh.position.addScaledVector(p.velocity, dt);
+                p.mesh.scale.multiplyScalar(0.9);
+                if(p.life <= 0) {
+                    levelSphere.remove(p.mesh);
+                    particles.splice(i,1);
+                }
+            }
+
+            // --- Player Invulnerability Flash ---
+            if (isInvulnerable) {
+                invulnerableTimer -= dt;
+                // Flash every 0.1s
+                playerMesh.visible = Math.floor(invulnerableTimer * 10) % 2 === 0;
+                
+                if (invulnerableTimer <= 0) {
+                    isInvulnerable = false;
+                    playerMesh.visible = true;
+                }
+            }
+
+            // --- Enemies ---
+            // Player local pos for collision checks
+            const pLocal = playerMesh.getWorldPosition(new THREE.Vector3());
+            levelSphere.worldToLocal(pLocal);
+
+            enemies.forEach(e => {
+                // Move
+                e.mesh.position.addScaledVector(e.velocity, dt);
+                e.mesh.position.normalize().multiplyScalar(SPHERE_RADIUS + 0.02);
+                
+                // Re-tangent
+                const norm = e.mesh.position.clone().normalize();
+                e.velocity.sub(norm.multiplyScalar(e.velocity.dot(norm))).normalize().multiplyScalar(0.2);
+
+                // Orient
+                e.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), norm);
+
+                // Wander
+                if(Math.random()<0.05) e.velocity.add(new THREE.Vector3(Math.random()-0.5,0,Math.random()-0.5).multiplyScalar(0.1));
+
+                // Shoot
+                e.shootTimer -= dt;
+                if(e.shootTimer <= 0) {
+                    spawnEnemyBullet(e);
+                    e.shootTimer = 1.0 + Math.random() * 2.0;
+                }
+
+                // Clean up dead bullets from enemy tracking
+                for(let k=e.bullets.length-1; k>=0; k--) {
+                    if(e.bullets[k].life <= 0) e.bullets.splice(k,1);
+                }
+
+                // Collision: Enemy Body vs Player
+                if (e.mesh.position.distanceToSquared(pLocal) < 0.0025) { // ~0.05 distance
+                    handlePlayerHit();
+                }
+            });
+
+            // --- Player Bullets ---
+            for(let i=playerBullets.length-1; i>=0; i--) {
+                const b = playerBullets[i];
+                b.life -= dt;
+                b.mesh.position.addScaledVector(b.velocity, dt);
+                b.mesh.position.normalize().multiplyScalar(SPHERE_RADIUS + 0.015);
+                
+                // Collision vs Enemies
+                let hit = false;
+                for(let j=enemies.length-1; j>=0; j--) {
+                    if (b.mesh.position.distanceToSquared(enemies[j].mesh.position) < 0.003) {
+                        // Kill Enemy
+                        createExplosion(enemies[j].mesh.position, 0xFF8800);
+                        levelSphere.remove(enemies[j].mesh);
+                        
+                        // Clean up enemy bullet refs
+                        enemies[j].bullets.forEach(eb => eb.life = 0); // Mark for deletion
+                        
+                        enemies.splice(j,1);
+                        levelSphere.remove(b.mesh);
+                        playerBullets.splice(i,1);
+                        hit = true;
+                        
+                        // Respawn to keep count at 8
+                        spawnEnemy();
+                        break;
+                    }
+                }
+                if (!hit && b.life <= 0) {
+                    levelSphere.remove(b.mesh);
+                    playerBullets.splice(i,1);
+                }
+            }
+
+            // --- Enemy Bullets ---
+            for(let i=enemyBullets.length-1; i>=0; i--) {
+                const b = enemyBullets[i];
+                b.life -= dt;
+                b.mesh.position.addScaledVector(b.velocity, dt);
+                b.mesh.position.normalize().multiplyScalar(SPHERE_RADIUS + 0.015);
+                
+                // Adjust velocity to follow curve (simple tangent correction)
+                const n = b.mesh.position.clone().normalize();
+                b.velocity.sub(n.multiplyScalar(b.velocity.dot(n))).normalize().multiplyScalar(0.3);
+
+                // Collision vs Player
+                if (b.mesh.position.distanceToSquared(pLocal) < 0.002) {
+                    handlePlayerHit();
+                    b.life = 0; // Destroy bullet
+                }
+
+                if (b.life <= 0) {
+                    levelSphere.remove(b.mesh);
+                    enemyBullets.splice(i,1);
+                }
+            }
+        }
+
+        function render() {
+            const dt = 0.016;
+
+            const session = renderer.xr.getSession();
+            let moveX=0, moveY=0, shotX=0, shotY=0;
+
+            if (session) {
+                for (const source of session.inputSources) {
+                    const gp = source.gamepad;
+                    if (!gp || gp.axes.length<4) continue;
+                    if (source.handedness==='left') { moveX=gp.axes[2]; moveY=gp.axes[3]; }
+                    if (source.handedness==='right') { shotX=gp.axes[2]; shotY=gp.axes[3]; }
+                }
+            }
+
+            // 1. Rotation (Slower speed: 1.4)
+            const rotSpeed = 1.4 * dt; 
+            if (Math.abs(moveX)>0.1 || Math.abs(moveY)>0.1) {
+                if(Math.abs(moveY)>0.1) levelSphere.rotateOnWorldAxis(new THREE.Vector3(1,0,0), moveY*rotSpeed);
+                if(Math.abs(moveX)>0.1) levelSphere.rotateOnWorldAxis(new THREE.Vector3(0,1,0), moveX*rotSpeed);
+            }
+
+            // 2. Shooting
+            if (shotCooldown > 0) shotCooldown -= dt;
+            if ((shotX*shotX + shotY*shotY) > 0.25 && shotCooldown <= 0) {
+                spawnPlayerBullet(shotX, shotY);
+                shotCooldown = 0.15;
+            }
+
+            // 3. Logic
+            update(dt);
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
