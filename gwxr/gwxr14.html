@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Surface Lock</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+        #overlay {
+            position: absolute; bottom: 20px; width: 100%; 
+            text-align: center; color: #0ff; font-family: monospace;
+            pointer-events: none; text-shadow: 1px 1px 0 #000;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">Left Stick: Rotate World (Ship Surface Locked)</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let worldGroup; 
+        let levelMesh;  
+        let playerMesh; 
+        let raycaster = new THREE.Raycaster();
+
+        // Config
+        const CAPSULE_RADIUS = 0.15;
+        const CAPSULE_LENGTH = 0.4;
+
+        init();
+
+        function init() {
+            // 1. Scene
+            scene = new THREE.Scene();
+            scene.background = null;
+
+            // 2. Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 3. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. AR Button
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            // 5. Lights
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // 6. Build Objects
+            buildGameWorld();
+
+            // 7. Controllers
+            const controller1 = renderer.xr.getController(0);
+            scene.add(controller1);
+
+            // 8. Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        function buildGameWorld() {
+            worldGroup = new THREE.Group();
+            worldGroup.position.set(0, 0, -1);
+            scene.add(worldGroup);
+
+            // --- Level (Sausage) ---
+            const geometry = new THREE.CapsuleGeometry(CAPSULE_RADIUS, CAPSULE_LENGTH, 4, 8);
+            const material = new THREE.MeshPhongMaterial({ 
+                color: 0x0044ff,
+                shininess: 30,
+                flatShading: true,
+                polygonOffset: true,
+                polygonOffsetFactor: 1, 
+                polygonOffsetUnits: 1
+            });
+            levelMesh = new THREE.Mesh(geometry, material);
+
+            // Wireframe
+            const wireGeo = new THREE.WireframeGeometry(geometry);
+            const wireMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+            levelMesh.add(new THREE.LineSegments(wireGeo, wireMat));
+
+            // Horizontal orientation
+            levelMesh.rotation.z = Math.PI / 2;
+            worldGroup.add(levelMesh);
+
+            // --- Player (Flattened Sphere) ---
+            // Note: We add Player to worldGroup, but we will update its position every frame via Raycast
+            const pGeo = new THREE.SphereGeometry(0.02, 16, 16);
+            pGeo.scale(1, 0.4, 1); // Flatten
+            const pMat = new THREE.MeshBasicMaterial({ color: 0x00FFFF });
+            playerMesh = new THREE.Mesh(pGeo, pMat);
+            
+            // Initial Position (will be overwritten by raycast)
+            playerMesh.position.set(0, 0, CAPSULE_RADIUS);
+            worldGroup.add(playerMesh);
+        }
+
+        function render() {
+            const dt = 0.016;
+            const session = renderer.xr.getSession();
+            let inputX = 0; 
+            let inputY = 0; 
+
+            // 1. Get Input
+            if (session) {
+                for (const source of session.inputSources) {
+                    if (source.handedness === 'left' && source.gamepad) {
+                        const gp = source.gamepad;
+                        if (gp.axes.length >= 4) {
+                            inputX = gp.axes[2];
+                            inputY = gp.axes[3];
+                        }
+                    }
+                }
+            }
+
+            // 2. Rotate World (Movement)
+            if (Math.abs(inputX) > 0.1 || Math.abs(inputY) > 0.1) {
+                const rotSpeed = 2.0 * dt;
+                
+                // Pitch (Up/Down) -> Rotate X
+                if (Math.abs(inputY) > 0.1) {
+                    levelMesh.rotateOnWorldAxis(new THREE.Vector3(1, 0, 0), inputY * rotSpeed);
+                }
+                // Yaw (Left/Right) -> Rotate Y
+                if (Math.abs(inputX) > 0.1) {
+                    levelMesh.rotateOnWorldAxis(new THREE.Vector3(0, 1, 0), inputX * rotSpeed);
+                }
+            }
+
+            // 3. Surface Lock Logic (The Fix for Disappearing)
+            // We Raycast from a point "In Front" of the worldGroup, aiming backwards at the levelMesh.
+            // This ensures we always find the surface point closest to the "Camera/Player View".
+            
+            // A. Define Ray Start (Local Space of WorldGroup: 2 meters towards user)
+            // We use worldGroup coordinates to ensure this lock works even if the user walks around the room.
+            // The ship is locked to the "Front" of the game container.
+            const rayOrigin = new THREE.Vector3(0, 0, 2); 
+            const rayDir = new THREE.Vector3(0, 0, -1); 
+
+            // B. Convert to World Space for the Raycaster
+            const rayOriginWorld = rayOrigin.clone().applyMatrix4(worldGroup.matrixWorld);
+            const rayDirWorld = rayDir.clone().transformDirection(worldGroup.matrixWorld).normalize();
+
+            raycaster.set(rayOriginWorld, rayDirWorld);
+
+            const intersects = raycaster.intersectObject(levelMesh);
+
+            if (intersects.length > 0) {
+                const hit = intersects[0];
+                
+                // C. Snap Player to Hit Point (World Space)
+                playerMesh.position.copy(hit.point);
+                
+                // D. Convert World Position back to Local Space (so it stays attached to worldGroup)
+                worldGroup.worldToLocal(playerMesh.position);
+                
+                // E. Align Player to Surface Normal
+                // We need the normal in Local Space to align the child mesh correctly
+                const normalWorld = hit.face.normal.clone().transformDirection(levelMesh.matrixWorld);
+                // Revert to local space of worldGroup (Since worldGroup is parent of player)
+                // Actually, simpler to align in World Space then re-parent conceptually? 
+                // We can just use quaternion slerp in World Space before conversion, or calculate rotation manually.
+                
+                // Easiest: Use `lookAt` logic or Quaternion setFromUnitVectors
+                // Since player is child of worldGroup, we need rotation relative to worldGroup.
+                // Let's maintain rotation in World Space:
+                const up = new THREE.Vector3(0, 1, 0); // Sphere 'top'
+                const targetQ = new THREE.Quaternion().setFromUnitVectors(up, normalWorld);
+                
+                // Apply to player (We need to account for parent rotation)
+                // playerMesh.quaternion = targetQ * inverse(parentWorldQuaternion)
+                const parentQ = worldGroup.quaternion.clone().invert();
+                playerMesh.quaternion.copy(parentQ.multiply(targetQ));
+                
+                // Rotate X 90 to face camera (since flattened sphere top is Y)
+                playerMesh.rotateX(Math.PI/2); 
+            }
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
