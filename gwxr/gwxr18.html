@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Sphere Shooter</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+        #overlay {
+            position: absolute; bottom: 20px; width: 100%; 
+            text-align: center; color: #0ff; font-family: monospace;
+            pointer-events: none; text-shadow: 1px 1px 0 #000;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">Left Stick: Move | Right Stick: Shoot (Max 3)</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let worldGroup;  
+        let levelSphere; 
+        let playerMesh;  
+        
+        // Game Entities
+        const enemies = []; 
+        const bullets = [];
+
+        // Game State
+        const SPHERE_RADIUS = 0.325;
+        let shotCooldown = 0;
+
+        init();
+
+        function init() {
+            // 1. Scene
+            scene = new THREE.Scene();
+            scene.background = null;
+
+            // 2. Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 3. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. AR Button
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            // 5. Lights
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // 6. Build World
+            buildGameWorld();
+
+            // 7. Input Controllers
+            const controller1 = renderer.xr.getController(0);
+            const controller2 = renderer.xr.getController(1);
+            scene.add(controller1);
+            scene.add(controller2);
+
+            // 8. Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        // --- Geometry Helpers ---
+
+        function createSaucerMesh(color) {
+            // Create a Group to hold the composite parts
+            const group = new THREE.Group();
+
+            // 1. The Hull (Flattened Sphere)
+            const hullGeo = new THREE.SphereGeometry(0.025, 32, 16);
+            hullGeo.scale(1, 0.3, 1); // Flatten Y
+            const hullMat = new THREE.MeshPhongMaterial({ color: color, flatShading: false });
+            const hull = new THREE.Mesh(hullGeo, hullMat);
+            group.add(hull);
+
+            // 2. The Cockpit (Dome on top)
+            const domeGeo = new THREE.SphereGeometry(0.012, 16, 16);
+            // Move dome up slightly on Y so it sits on the hull
+            domeGeo.translate(0, 0.01, 0); 
+            const domeMat = new THREE.MeshPhongMaterial({ color: 0x88CCFF, shininess: 100 });
+            const dome = new THREE.Mesh(domeGeo, domeMat);
+            group.add(dome);
+
+            // 3. Engine/Detail Ring (Torus)
+            const ringGeo = new THREE.TorusGeometry(0.015, 0.002, 8, 32);
+            ringGeo.rotateX(Math.PI/2);
+            const ringMat = new THREE.MeshBasicMaterial({ color: 0x333333 });
+            const ring = new THREE.Mesh(ringGeo, ringMat);
+            group.add(ring);
+
+            // Orientation Note:
+            // This group's local Y axis is "Up" (through the dome).
+            // When placing on sphere, we align Local Y to Surface Normal.
+            return group;
+        }
+
+        function buildGameWorld() {
+            worldGroup = new THREE.Group();
+            worldGroup.position.set(0, 0, -1);
+            scene.add(worldGroup);
+
+            // --- 1. Level Sphere ---
+            levelSphere = new THREE.Group();
+
+            // Main Planet
+            const geometry = new THREE.SphereGeometry(SPHERE_RADIUS, 64, 64);
+            const material = new THREE.MeshPhongMaterial({ 
+                color: 0x888888, 
+                shininess: 10,
+                polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1
+            });
+            const mainMesh = new THREE.Mesh(geometry, material);
+            
+            // Wireframe
+            const wireGeo = new THREE.WireframeGeometry(geometry);
+            const wireMat = new THREE.LineBasicMaterial({ color: 0x444444, linewidth: 1 });
+            mainMesh.add(new THREE.LineSegments(wireGeo, wireMat));
+            levelSphere.add(mainMesh);
+
+            // Trench & Dish
+            const eqGeo = new THREE.TorusGeometry(SPHERE_RADIUS, 0.005, 16, 100);
+            const eqMat = new THREE.MeshBasicMaterial({ color: 0x222222 });
+            const equator = new THREE.Mesh(eqGeo, eqMat);
+            equator.rotation.x = Math.PI / 2;
+            levelSphere.add(equator);
+
+            const dishGeo = new THREE.CircleGeometry(0.08, 32);
+            const dishMat = new THREE.MeshBasicMaterial({ color: 0x444444, side: THREE.DoubleSide });
+            const dish = new THREE.Mesh(dishGeo, dishMat);
+            dish.position.set(0, 0.6, 0.5).normalize().multiplyScalar(SPHERE_RADIUS + 0.001);
+            dish.lookAt(0,0,0);
+            levelSphere.add(dish);
+
+            worldGroup.add(levelSphere);
+
+            // --- 2. Player Ship (Static) ---
+            playerMesh = createSaucerMesh(0x00FFFF);
+            // Position fixed at Z+ radius
+            playerMesh.position.set(0, 0, SPHERE_RADIUS + 0.015);
+            // Rotate X 90 so the top (Y) points towards Camera (Z)
+            playerMesh.rotation.x = Math.PI / 2; 
+            worldGroup.add(playerMesh);
+
+            // --- 3. Enemies ---
+            for (let i = 0; i < 3; i++) createEnemy();
+        }
+
+        function createEnemy() {
+            const mesh = createSaucerMesh(0xFF4400);
+            levelSphere.add(mesh); // Child of rotating world
+
+            // Random Start Pos
+            const pos = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5);
+            pos.normalize().multiplyScalar(SPHERE_RADIUS + 0.015);
+            mesh.position.copy(pos);
+
+            // Calc Velocity
+            const normal = pos.clone().normalize();
+            const rnd = new THREE.Vector3(Math.random(), Math.random(), Math.random());
+            const tangent = new THREE.Vector3().crossVectors(normal, rnd).normalize();
+            const velocity = tangent.multiplyScalar(0.2); // Speed
+
+            enemies.push({ mesh, velocity });
+        }
+
+        function fireBullet(stickX, stickY) {
+            if (bullets.length >= 3) return;
+
+            // 1. Create Bullet
+            const geo = new THREE.SphereGeometry(0.006, 8, 8);
+            const mat = new THREE.MeshBasicMaterial({ color: 0xAAFFFF }); // Pale Blue
+            const bulletMesh = new THREE.Mesh(geo, mat);
+            
+            // 2. Position: Start at Player's position relative to the rotating sphere
+            // Convert Player World Pos -> LevelSphere Local Pos
+            const startPos = playerMesh.position.clone(); // In worldGroup
+            // Since worldGroup is (0,0,-1) and levelSphere is at (0,0,0) inside it,
+            // and player is at (0,0,Radius) inside worldGroup.
+            // We need player pos in levelSphere's local space (which is rotating).
+            
+            // To be safe, do full world transform chain:
+            const worldPos = playerMesh.getWorldPosition(new THREE.Vector3());
+            levelSphere.worldToLocal(worldPos); // Now in sphere local space
+            bulletMesh.position.copy(worldPos);
+
+            // 3. Velocity Direction
+            // Stick input is relative to Camera View (World Space basically).
+            // Up (-Y) on stick = Up on screen. Right (+X) on stick = Right on screen.
+            const shootDirWorld = new THREE.Vector3(stickX, -stickY, 0).normalize();
+            
+            // Transform World Direction to LevelSphere Local Direction
+            // This ensures if the sphere is upside down, the bullet still goes "Up" relative to the screen.
+            // Vector transformation requires inverse of the container's rotation.
+            const velLocal = shootDirWorld.transformDirection(levelSphere.matrixWorld.clone().invert());
+            
+            // Constrain to tangent plane?
+            // The transform above might push it into/out of sphere if player isn't perfectly centered?
+            // Player is centered. Tangent plane is XY plane in View Space.
+            // So transformed vector should be tangent to the surface at that local point.
+            
+            levelSphere.add(bulletMesh);
+
+            bullets.push({
+                mesh: bulletMesh,
+                velocity: velLocal.multiplyScalar(0.6), // Fast bullet
+                life: 2.0 // Seconds
+            });
+        }
+
+        // --- Updates ---
+
+        function updateEnemies(dt) {
+            enemies.forEach(e => {
+                // Move
+                e.mesh.position.addScaledVector(e.velocity, dt);
+                
+                // Snap to Surface
+                e.mesh.position.normalize().multiplyScalar(SPHERE_RADIUS + 0.015);
+
+                // Correct Velocity to stay tangent
+                const normal = e.mesh.position.clone().normalize();
+                const dot = e.velocity.dot(normal);
+                e.velocity.sub(normal.multiplyScalar(dot)).normalize().multiplyScalar(0.2);
+
+                // Wander
+                if (Math.random() < 0.05) {
+                    const noise = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5);
+                    e.velocity.add(noise.multiplyScalar(0.1));
+                }
+
+                // Orient: Up (Local Y) aligns with Normal
+                e.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), normal);
+            });
+        }
+
+        function updateBullets(dt) {
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                const b = bullets[i];
+                b.life -= dt;
+                
+                // Move
+                b.mesh.position.addScaledVector(b.velocity, dt);
+                
+                // Snap to surface height (simple arc physics)
+                b.mesh.position.normalize().multiplyScalar(SPHERE_RADIUS + 0.015);
+                
+                // Re-tangent velocity
+                const normal = b.mesh.position.clone().normalize();
+                const dot = b.velocity.dot(normal);
+                b.velocity.sub(normal.multiplyScalar(dot)).normalize().multiplyScalar(0.6);
+
+                // Check Collisions
+                let hit = false;
+                for (let j = enemies.length - 1; j >= 0; j--) {
+                    const e = enemies[j];
+                    // Distance check (Squared is faster)
+                    const distSq = b.mesh.position.distanceToSquared(e.mesh.position);
+                    if (distSq < 0.0025) { // Approx (0.05m)^2
+                        // Destroy Enemy
+                        levelSphere.remove(e.mesh);
+                        enemies.splice(j, 1);
+                        
+                        // Create replacement enemy to keep game going
+                        createEnemy();
+                        
+                        hit = true;
+                        break; 
+                    }
+                }
+
+                if (hit || b.life <= 0) {
+                    levelSphere.remove(b.mesh);
+                    bullets.splice(i, 1);
+                }
+            }
+        }
+
+        function render() {
+            const dt = 0.016;
+
+            // --- Input ---
+            const session = renderer.xr.getSession();
+            let moveX=0, moveY=0;
+            let shotX=0, shotY=0;
+
+            if (session) {
+                for (const source of session.inputSources) {
+                    const gp = source.gamepad;
+                    if (!gp || gp.axes.length < 4) continue;
+
+                    if (source.handedness === 'left') {
+                        moveX = gp.axes[2];
+                        moveY = gp.axes[3];
+                    }
+                    if (source.handedness === 'right') {
+                        shotX = gp.axes[2];
+                        shotY = gp.axes[3];
+                    }
+                }
+            }
+
+            // --- 1. Rotate World (Left Stick) ---
+            const rotSpeed = 2.0 * dt;
+            if (Math.abs(moveX) > 0.1 || Math.abs(moveY) > 0.1) {
+                if (Math.abs(moveY) > 0.1) levelSphere.rotateOnWorldAxis(new THREE.Vector3(1,0,0), moveY * rotSpeed);
+                if (Math.abs(moveX) > 0.1) levelSphere.rotateOnWorldAxis(new THREE.Vector3(0,1,0), moveX * rotSpeed);
+            }
+
+            // --- 2. Fire Bullets (Right Stick) ---
+            if (shotCooldown > 0) shotCooldown -= dt;
+            
+            // Calculate magnitude to detect push
+            const shotMag = Math.sqrt(shotX*shotX + shotY*shotY);
+            if (shotMag > 0.5 && shotCooldown <= 0) {
+                fireBullet(shotX, shotY);
+                shotCooldown = 0.25; // 4 shots per second max
+            }
+
+            // --- 3. Updates ---
+            updateEnemies(dt);
+            updateBullets(dt);
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
