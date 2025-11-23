@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Twin Stick Shooter</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; font-family: monospace; }
+        #overlay {
+            position: absolute; bottom: 20px; left: 0; width: 100%; 
+            text-align: center; color: #0f0; pointer-events: none;
+            font-size: 14px; text-shadow: 1px 1px 0 #000;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">v1.0 | Left Stick: Move | Right Stick: Shoot | Trigger: Start</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+        // ============================================================================
+        // 1. CONFIGURATION & CONSTANTS
+        // ============================================================================
+        const CONFIG = {
+            distance: 1.0,  // Meters in front of user
+            colors: {
+                player: 0x00FFFF,   // Cyan
+                enemy: 0xFF0055,    // Red/Pink
+                boss: 0xFFA500,     // Orange
+                bulletP: 0xFFFF00,  // Yellow (Player)
+                bulletE: 0xFF0000,  // Red (Enemy)
+                wire: 0xFFFFFF      // White outlines
+            }
+        };
+
+        const SHAPES = {
+            SAUSAGE: 0,
+            SPHERE: 1,
+            TORUS: 2
+        };
+
+        // ============================================================================
+        // 2. GLOBALS & STATE
+        // ============================================================================
+        // Engine
+        let camera, scene, renderer;
+        let controller1, controller2;
+        let raycaster = new THREE.Raycaster();
+        
+        // Game World
+        let worldGroup;     // The container for the level (this gets positioned in room)
+        let levelMesh;      // The actual shape (rotates inside worldGroup)
+        let playerCursor;   // The visual ship
+        let uiMesh;         // Floating HUD
+
+        // Logic State
+        let isPlaying = false;
+        let isBossFight = false;
+        let level = 1;
+        let score = 0;
+        let lives = 3;
+        let levelTimer = 10;
+        let shotCooldown = 0;
+
+        // Entities
+        let bullets = [];
+        let enemies = [];
+        let particles = [];
+
+        // Input Data
+        const input = { 
+            move: new THREE.Vector2(), 
+            shoot: new THREE.Vector2(), 
+            trigger: false 
+        };
+
+        // Audio Context (Lazy load)
+        let audioCtx = null;
+
+        // ============================================================================
+        // 3. INITIALIZATION (Clean & Lean)
+        // ============================================================================
+        init();
+
+        function init() {
+            // Scene Setup (Null background for Passthrough)
+            scene = new THREE.Scene();
+            scene.background = null;
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // AR Button
+            const arBtn = ARButton.createButton(renderer, { requiredFeatures: ['local'] });
+            document.body.appendChild(arBtn);
+
+            // Lighting
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // World Container
+            worldGroup = new THREE.Group();
+            worldGroup.position.set(0, 0, -CONFIG.distance); // Default pos
+            scene.add(worldGroup);
+
+            // Player Ship (Visual only, raycasted)
+            createPlayerShip();
+
+            // HUD
+            createHUD();
+
+            // Controllers
+            setupControllers();
+
+            // Initialize Level 1 immediately (Visible Sausage)
+            createLevel(1);
+
+            // Start Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        function setupControllers() {
+            const factory = new XRControllerModelFactory();
+            
+            // Controller 1 (Left)
+            controller1 = renderer.xr.getController(0);
+            const grip1 = renderer.xr.getControllerGrip(0);
+            grip1.add(factory.createControllerModel(grip1));
+            scene.add(grip1);
+            scene.add(controller1);
+
+            // Controller 2 (Right)
+            controller2 = renderer.xr.getController(1);
+            const grip2 = renderer.xr.getControllerGrip(1);
+            grip2.add(factory.createControllerModel(grip2));
+            scene.add(grip2);
+            scene.add(controller2);
+
+            // Trigger Listener (Right Hand)
+            controller2.addEventListener('selectstart', onTriggerStart);
+        }
+
+        function createPlayerShip() {
+            const geo = new THREE.ConeGeometry(0.015, 0.04, 8);
+            geo.rotateX(Math.PI / 2); // Point forward
+            const mat = new THREE.MeshBasicMaterial({ color: CONFIG.colors.player });
+            playerCursor = new THREE.Mesh(geo, mat);
+            playerCursor.visible = false; // Hidden until hits surface
+            scene.add(playerCursor); // Add to scene, not world, for independent rotation
+        }
+
+        // ============================================================================
+        // 4. LEVEL & GRAPHICS GENERATION (The "Sausage" Style)
+        // ============================================================================
+        function createLevel(lvl) {
+            // Clean up old level
+            if (levelMesh) {
+                worldGroup.remove(levelMesh);
+                levelMesh.geometry.dispose();
+                // Clear entities
+                enemies.forEach(e => worldGroup.remove(e.mesh));
+                bullets.forEach(b => worldGroup.remove(b.mesh));
+                enemies = [];
+                bullets = [];
+            }
+
+            // Determine Shape
+            // L1: Sausage (Blue), L2: Sphere (Grey), L3: Torus (Light Grey)
+            let geometry, color;
+            const type = (lvl - 1) % 3;
+
+            if (type === SHAPES.SAUSAGE) {
+                geometry = new THREE.CapsuleGeometry(0.15, 0.4, 4, 8);
+                color = 0x0044ff; 
+            } else if (type === SHAPES.SPHERE) {
+                geometry = new THREE.IcosahedronGeometry(0.25, 2);
+                color = 0x444444;
+            } else {
+                geometry = new THREE.TorusGeometry(0.2, 0.08, 16, 32);
+                color = 0x888888;
+            }
+
+            // Solid Material (Polygon Offset prevents Z-fighting with wireframe)
+            const material = new THREE.MeshPhongMaterial({
+                color: color,
+                shininess: 30,
+                flatShading: true,
+                polygonOffset: true,
+                polygonOffsetFactor: 1, 
+                polygonOffsetUnits: 1
+            });
+
+            levelMesh = new THREE.Mesh(geometry, material);
+
+            // Wireframe Overlay
+            const wireGeo = new THREE.WireframeGeometry(geometry);
+            const wireMat = new THREE.LineBasicMaterial({ color: CONFIG.colors.wire, linewidth: 2 });
+            const wireMesh = new THREE.LineSegments(wireGeo, wireMat);
+            levelMesh.add(wireMesh);
+
+            worldGroup.add(levelMesh);
+        }
+
+        // ============================================================================
+        // 5. INPUT & CONTROL LOGIC
+        // ============================================================================
+        function onTriggerStart() {
+            // Initialize Audio on first user gesture
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                playSound('start');
+            } else if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+
+            if (!isPlaying) {
+                // START GAME
+                isPlaying = true;
+                score = 0; lives = 3; level = 1;
+                levelTimer = 10;
+                createLevel(1);
+                recenterWorld();
+            } else if (lives <= 0) {
+                // RESTART
+                lives = 3; score = 0; level = 1;
+                isPlaying = true;
+                createLevel(1);
+            } else {
+                // RECENTER while playing
+                recenterWorld();
+            }
+        }
+
+        function recenterWorld() {
+            // Place world 1m in front of current camera view
+            const vec = new THREE.Vector3();
+            const dir = new THREE.Vector3();
+            camera.getWorldPosition(vec);
+            camera.getWorldDirection(dir);
+            dir.y = 0; dir.normalize(); // Flatten height
+            
+            worldGroup.position.copy(vec).add(dir.multiplyScalar(CONFIG.distance));
+            worldGroup.lookAt(vec); // Face player
+        }
+
+        function pollGamepads() {
+            input.move.set(0,0);
+            input.shoot.set(0,0);
+
+            const session = renderer.xr.getSession();
+            if (!session) return;
+
+            for (const source of session.inputSources) {
+                if (!source.gamepad) continue;
+                const gp = source.gamepad;
+                // Axis 2/3 are usually thumbsticks
+                if (source.handedness === 'left' && gp.axes.length >= 4) {
+                    input.move.set(gp.axes[2], gp.axes[3]);
+                }
+                if (source.handedness === 'right' && gp.axes.length >= 4) {
+                    input.shoot.set(gp.axes[2], gp.axes[3]);
+                }
+            }
+        }
+
+        // ============================================================================
+        // 6. MAIN GAME LOOP
+        // ============================================================================
+        function render() {
+            const dt = 0.016; // Fixed timestep approx
+
+            pollGamepads();
+            updateHUD();
+
+            if (isPlaying && lives > 0) {
+                
+                // --- A. MOVEMENT (Rotate World) ---
+                if (input.move.length() > 0.1) {
+                    // Rotate world perpendicular to stick input
+                    const axis = new THREE.Vector3(input.move.y, -input.move.x, 0).normalize();
+                    const speed = 2.0 * dt;
+                    levelMesh.rotateOnWorldAxis(axis, input.move.length() * speed);
+                }
+
+                // --- B. PLAYER RAYCAST ---
+                updatePlayerCursor();
+
+                // --- C. SHOOTING ---
+                if (shotCooldown > 0) shotCooldown -= dt;
+                if (input.shoot.length() > 0.3 && shotCooldown <= 0) {
+                    fireBullet(false); // false = player bullet
+                    shotCooldown = 0.15;
+                }
+
+                // --- D. GAME LOGIC ---
+                updateEntities(dt);
+                updateLevelLogic(dt);
+
+            } else {
+                // Idle rotation if not playing
+                if(levelMesh) levelMesh.rotation.y += 0.5 * dt;
+            }
+            
+            updateParticles(dt);
+            renderer.render(scene, camera);
+        }
+
+        function updatePlayerCursor() {
+            const camPos = new THREE.Vector3();
+            const camDir = new THREE.Vector3();
+            camera.getWorldPosition(camPos);
+            camera.getWorldDirection(camDir);
+            
+            raycaster.set(camPos, camDir);
+            const hits = raycaster.intersectObject(levelMesh); // Hit the solid mesh
+
+            if (hits.length > 0) {
+                playerCursor.visible = true;
+                const hit = hits[0];
+                playerCursor.position.copy(hit.point);
+                
+                // Align to normal
+                const n = hit.face.normal.clone().transformDirection(levelMesh.matrixWorld);
+                const up = new THREE.Vector3(0,1,0);
+                const q = new THREE.Quaternion().setFromUnitVectors(up, n);
+                playerCursor.quaternion.slerp(q, 0.5); // Smooth align
+            } else {
+                playerCursor.visible = false;
+            }
+        }
+
+        function updateLevelLogic(dt) {
+            levelTimer -= dt;
+            
+            // Spawn Enemies
+            const maxEnemies = level + 3;
+            if (enemies.length < maxEnemies && !isBossFight && Math.random() < 0.02) {
+                spawnEnemy(false);
+            }
+
+            // Level Progression
+            if (levelTimer <= 0) {
+                if (!isBossFight) {
+                    // Start Boss
+                    isBossFight = true;
+                    levelTimer = 10; // Boss time
+                    spawnEnemy(true); // Spawn Boss
+                    playSound('siren');
+                } else {
+                    // Boss Time Over (Game doesn't specify logic, assuming loop or next level if boss alive?)
+                    // Let's force next level if time runs out to keep flow
+                    nextLevel();
+                }
+            }
+        }
+
+        function nextLevel() {
+            level++;
+            isBossFight = false;
+            levelTimer = 10;
+            createLevel(level);
+            playSound('start');
+        }
+
+        // ============================================================================
+        // 7. ENTITIES (Bullets & Enemies)
+        // ============================================================================
+        function fireBullet(isEnemy, originPos, targetPos) {
+            // If player shoots, origin is playerCursor
+            let pos, dir;
+            
+            if (!isEnemy) {
+                if (!playerCursor.visible) return;
+                // Player shoots based on Stick Direction relative to Camera View
+                const shootDir = new THREE.Vector3(input.shoot.x, -input.shoot.y, 0).applyQuaternion(camera.quaternion).normalize();
+                
+                // Convert World Direction to Local Direction (so bullet moves with rotating world)
+                dir = shootDir.transformDirection(levelMesh.matrixWorld.clone().invert());
+                
+                // Start pos local
+                pos = levelMesh.worldToLocal(playerCursor.position.clone());
+                playSound('shoot');
+            } else {
+                // Enemy shoots at player
+                pos = originPos.clone(); // Local
+                // Direction towards player (Local)
+                const playerLocal = levelMesh.worldToLocal(playerCursor.position.clone());
+                dir = new THREE.Vector3().copy(playerLocal).sub(pos).normalize();
+                // Add spread
+                dir.x += (Math.random()-0.5)*0.5;
+                dir.y += (Math.random()-0.5)*0.5;
+                dir.normalize();
+            }
+
+            const geo = new THREE.SphereGeometry(isEnemy ? 0.01 : 0.008);
+            const mat = new THREE.MeshBasicMaterial({ color: isEnemy ? CONFIG.colors.bulletE : CONFIG.colors.bulletP });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.copy(pos);
+            levelMesh.add(mesh);
+
+            bullets.push({
+                mesh: mesh,
+                vel: dir.multiplyScalar(isEnemy ? 0.2 : 0.5), // Speed
+                life: 1.5,
+                isEnemy: isEnemy
+            });
+        }
+
+        function spawnEnemy(isBoss) {
+            const size = isBoss ? 0.08 : 0.03;
+            const hp = isBoss ? level + 5 : 1;
+            const geo = new THREE.OctahedronGeometry(size);
+            const mat = new THREE.MeshBasicMaterial({ 
+                color: isBoss ? CONFIG.colors.boss : CONFIG.colors.enemy, 
+                wireframe: true 
+            });
+            const mesh = new THREE.Mesh(geo, mat);
+            
+            // Random start pos on surface (Approximate)
+            const dir = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
+            mesh.position.copy(dir.multiplyScalar(0.25)); // Slightly inside/outside depends on shape
+            levelMesh.add(mesh);
+
+            enemies.push({
+                mesh: mesh,
+                hp: hp,
+                isBoss: isBoss,
+                timer: 2.0 // Shoot timer
+            });
+        }
+
+        function updateEntities(dt) {
+            // A. Bullets
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                const b = bullets[i];
+                b.life -= dt;
+                b.mesh.position.addScaledVector(b.vel, dt);
+
+                if (b.life <= 0) {
+                    levelMesh.remove(b.mesh);
+                    bullets.splice(i, 1);
+                    continue;
+                }
+
+                // Collision
+                const bWorld = b.mesh.position.clone().applyMatrix4(levelMesh.matrixWorld);
+                
+                if (b.isEnemy) {
+                    // Hit Player?
+                    if (playerCursor.visible && bWorld.distanceTo(playerCursor.position) < 0.04) {
+                        damagePlayer();
+                        levelMesh.remove(b.mesh);
+                        bullets.splice(i,1);
+                    }
+                } else {
+                    // Hit Enemy?
+                    for (let j = enemies.length - 1; j >= 0; j--) {
+                        const e = enemies[j];
+                        const eWorld = e.mesh.position.clone().applyMatrix4(levelMesh.matrixWorld);
+                        
+                        if (bWorld.distanceTo(eWorld) < (e.isBoss ? 0.1 : 0.05)) {
+                            // HIT
+                            createExplosion(eWorld, CONFIG.colors.enemy, 5);
+                            e.hp--;
+                            levelMesh.remove(b.mesh);
+                            bullets.splice(i, 1);
+                            
+                            if (e.hp <= 0) {
+                                // KILL
+                                createExplosion(eWorld, CONFIG.colors.boss, 20);
+                                levelMesh.remove(e.mesh);
+                                enemies.splice(j, 1);
+                                score += 10;
+                                playSound('explode');
+                                if (e.isBoss) nextLevel();
+                            } else {
+                                playSound('hit');
+                            }
+                            break; // Bullet destroyed
+                        }
+                    }
+                }
+            }
+
+            // B. Enemies
+            if (playerCursor.visible) {
+                const playerLocal = levelMesh.worldToLocal(playerCursor.position.clone());
+                
+                for (let i = enemies.length - 1; i >= 0; i--) {
+                    const e = enemies[i];
+                    // Move
+                    const dir = new THREE.Vector3().copy(playerLocal).sub(e.mesh.position).normalize();
+                    e.mesh.position.addScaledVector(dir, (e.isBoss?0.05:0.1) * dt);
+                    // Snap (Simple normalize for robustness)
+                    if(levelMesh.geometry.type === 'CapsuleGeometry') {
+                        // Capsule snap is harder, skipping strict snap for simplicity as "Floating" looks fine in vector graphics
+                    } else {
+                         e.mesh.position.normalize().multiplyScalar(0.25);
+                    }
+
+                    // Shoot
+                    e.timer -= dt;
+                    if (e.timer <= 0) {
+                        fireBullet(true, e.mesh.position);
+                        e.timer = 2.0;
+                    }
+                }
+            }
+        }
+
+        function damagePlayer() {
+            lives--;
+            playSound('die');
+            createExplosion(playerCursor.position, CONFIG.colors.player, 30);
+            if (lives <= 0) {
+                // Game Over
+            }
+        }
+
+        // ============================================================================
+        // 8. EFFECTS & AUDIO
+        // ============================================================================
+        function createExplosion(worldPos, color, count) {
+            const c = new THREE.Color(color);
+            for(let i=0; i<count; i++) {
+                const p = new THREE.Mesh(
+                    new THREE.BoxGeometry(0.01,0.01,0.01),
+                    new THREE.MeshBasicMaterial({color:c})
+                );
+                p.position.copy(worldPos);
+                scene.add(p); // World space particles
+                particles.push({
+                    mesh: p,
+                    vel: new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize().multiplyScalar(Math.random()*0.5),
+                    life: 0.5
+                });
+            }
+        }
+
+        function updateParticles(dt) {
+            for(let i=particles.length-1; i>=0; i--) {
+                const p = particles[i];
+                p.life -= dt;
+                p.mesh.position.addScaledVector(p.vel, dt);
+                if(p.life <= 0) {
+                    scene.remove(p.mesh);
+                    particles.splice(i,1);
+                }
+            }
+        }
+
+        function playSound(type) {
+            if(!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            
+            const t = audioCtx.currentTime;
+            
+            if (type === 'shoot') {
+                osc.type = 'square';
+                osc.frequency.setValueAtTime(800, t);
+                osc.frequency.exponentialRampToValueAtTime(100, t+0.1);
+                gain.gain.setValueAtTime(0.1, t);
+                gain.gain.linearRampToValueAtTime(0, t+0.1);
+                osc.start(t); osc.stop(t+0.1);
+            } else if (type === 'explode') {
+                osc.type = 'sawtooth';
+                osc.frequency.setValueAtTime(100, t);
+                osc.frequency.linearRampToValueAtTime(10, t+0.3);
+                gain.gain.setValueAtTime(0.2, t);
+                gain.gain.linearRampToValueAtTime(0, t+0.3);
+                osc.start(t); osc.stop(t+0.3);
+            } else if (type === 'start') {
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(440, t);
+                osc.frequency.setValueAtTime(880, t+0.1);
+                gain.gain.setValueAtTime(0.1, t);
+                gain.gain.linearRampToValueAtTime(0, t+0.5);
+                osc.start(t); osc.stop(t+0.5);
+            } else if (type === 'siren') {
+                // Quick looping siren alert
+                osc.type = 'triangle';
+                osc.frequency.setValueAtTime(300, t);
+                osc.frequency.linearRampToValueAtTime(600, t+0.5);
+                gain.gain.setValueAtTime(0.1, t);
+                gain.gain.linearRampToValueAtTime(0, t+1.0);
+                osc.start(t); osc.stop(t+1.0);
+            }
+        }
+
+        // ============================================================================
+        // 9. UI (Canvas)
+        // ============================================================================
+        function createHUD() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512; canvas.height = 128;
+            const ctx = canvas.getContext('2d');
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+            uiMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 0.125), mat);
+            uiMesh.position.set(0, 0.35, -CONFIG.distance);
+            scene.add(uiMesh);
+            
+            uiMesh.userData.ctx = ctx;
+            uiMesh.userData.tex = tex;
+        }
+
+        function updateHUD() {
+            if(!uiMesh) return;
+            const ctx = uiMesh.userData.ctx;
+            ctx.clearRect(0,0,512,128);
+            
+            // Background
+            ctx.fillStyle = 'rgba(0,0,0,0.5)';
+            ctx.fillRect(0,0,512,128);
+            
+            ctx.font = 'bold 30px Monospace';
+            ctx.fillStyle = '#fff';
+            
+            if (!isPlaying) {
+                ctx.textAlign = 'center';
+                ctx.fillText("PULL RIGHT TRIGGER TO START", 256, 75);
+            } else if (lives <= 0) {
+                ctx.fillStyle = '#f00';
+                ctx.textAlign = 'center';
+                ctx.fillText(`GAME OVER - SCORE: ${score}`, 256, 75);
+            } else {
+                ctx.textAlign = 'left';
+                ctx.fillStyle = '#0ff';
+                ctx.fillText(`SCORE: ${score}`, 20, 50);
+                ctx.fillText(`LIVES: ${lives}`, 20, 90);
+                
+                ctx.textAlign = 'right';
+                ctx.fillStyle = isBossFight ? '#fa0' : '#0f0';
+                ctx.fillText(`LVL: ${level}`, 490, 50);
+                ctx.fillText(`${Math.ceil(levelTimer)}`, 490, 90);
+            }
+            uiMesh.userData.tex.needsUpdate = true;
+            
+            // Keep HUD above world
+            if (worldGroup) {
+                uiMesh.position.copy(worldGroup.position);
+                uiMesh.position.y += 0.4;
+                uiMesh.lookAt(camera.position);
+            }
+        }
+    </script>
+</body>
+</html>
