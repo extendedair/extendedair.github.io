@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Player Movement</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+        #overlay {
+            position: absolute; bottom: 20px; width: 100%; 
+            text-align: center; color: #0ff; font-family: monospace;
+            pointer-events: none; text-shadow: 1px 1px 0 #000;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">Left Stick: Move Ship</div>
+
+    <!-- Load Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+        let camera, scene, renderer;
+        let controller1; // Left Controller
+        let levelMesh, playerMesh;
+        let raycaster = new THREE.Raycaster();
+        
+        // Enemies Array
+        const enemies = [];
+
+        // Constants
+        const CAPSULE_RADIUS = 0.15;
+        const CAPSULE_LENGTH = 0.4;
+
+        init();
+
+        function init() {
+            // 1. Scene
+            scene = new THREE.Scene();
+            scene.background = null; // AR Passthrough
+
+            // 2. Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 3. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. AR Button
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            // 5. Lights
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // 6. Setup Level & Entities
+            createLevel();
+            createPlayer();
+            for(let i=0; i<3; i++) createEnemy();
+
+            // 7. Setup Controller (For Input)
+            setupControllers();
+
+            // 8. Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        function setupControllers() {
+            // We only need to listen to the controller to get gamepad data
+            controller1 = renderer.xr.getController(0);
+            scene.add(controller1);
+
+            // Optional: Add visual model if desired, but not strictly needed for logic
+            const factory = new XRControllerModelFactory();
+            const grip1 = renderer.xr.getControllerGrip(0);
+            grip1.add(factory.createControllerModel(grip1));
+            scene.add(grip1);
+        }
+
+        function createLevel() {
+            const group = new THREE.Group();
+
+            // Geometry
+            const geometry = new THREE.CapsuleGeometry(CAPSULE_RADIUS, CAPSULE_LENGTH, 4, 8);
+            
+            // Material (Solid + Offset)
+            const material = new THREE.MeshPhongMaterial({ 
+                color: 0x0044ff,
+                shininess: 30,
+                flatShading: true,
+                polygonOffset: true,
+                polygonOffsetFactor: 1, 
+                polygonOffsetUnits: 1
+            });
+            levelMesh = new THREE.Mesh(geometry, material);
+
+            // Wireframe
+            const wireGeo = new THREE.WireframeGeometry(geometry);
+            const wireMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+            levelMesh.add(new THREE.LineSegments(wireGeo, wireMat));
+            
+            group.add(levelMesh);
+            
+            // Position 1 meter in front
+            group.position.set(0, 0, -1);
+            scene.add(group);
+        }
+
+        function createPlayer() {
+            // Cyan Cone pointing Z-forward (will be rotated to match normal)
+            const geo = new THREE.ConeGeometry(0.015, 0.04, 16);
+            geo.rotateX(Math.PI / 2); 
+            const mat = new THREE.MeshBasicMaterial({ color: 0x00FFFF });
+            
+            playerMesh = new THREE.Mesh(geo, mat);
+            playerMesh.visible = false; // Hide until it hits the surface
+            
+            // Add to Scene (Not level) so it aligns with Camera View
+            scene.add(playerMesh);
+        }
+
+        function createEnemy() {
+            const geo = new THREE.OctahedronGeometry(0.03);
+            const mat = new THREE.MeshPhongMaterial({ color: 0xFF0055, flatShading: true });
+            const mesh = new THREE.Mesh(geo, mat);
+            
+            // Wireframe
+            const wGeo = new THREE.WireframeGeometry(geo);
+            const wMat = new THREE.LineBasicMaterial({ color: 0xffffff });
+            mesh.add(new THREE.LineSegments(wGeo, wMat));
+
+            levelMesh.add(mesh); // Child of level
+
+            // Random Pos
+            const pos = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize().multiplyScalar(CAPSULE_RADIUS + 0.1);
+            mesh.position.copy(pos);
+            snapToSurface(mesh);
+
+            enemies.push({
+                mesh: mesh,
+                velocity: new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize().multiplyScalar(0.005)
+            });
+        }
+
+        // Helper to stick objects to capsule surface
+        function snapToSurface(obj) {
+            const p = obj.position;
+            const halfLen = CAPSULE_LENGTH / 2;
+            const clampedY = Math.max(-halfLen, Math.min(halfLen, p.y));
+            const center = new THREE.Vector3(0, clampedY, 0);
+            const dir = new THREE.Vector3().subVectors(p, center).normalize();
+            
+            // Radius + slight offset
+            obj.position.copy(center).add(dir.multiplyScalar(CAPSULE_RADIUS + 0.025));
+            
+            // Align rotation
+            const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0), dir);
+            obj.quaternion.slerp(q, 1);
+        }
+
+        function render() {
+            // --- 1. Handle Input (Left Stick) ---
+            const session = renderer.xr.getSession();
+            let moveX = 0, moveY = 0;
+
+            if (session) {
+                for (const source of session.inputSources) {
+                    if (source.handedness === 'left' && source.gamepad) {
+                        const gp = source.gamepad;
+                        if (gp.axes.length >= 4) {
+                            moveX = gp.axes[2];
+                            moveY = gp.axes[3];
+                        }
+                    }
+                }
+            }
+
+            // Apply Rotation to Level Mesh if stick moved
+            if (Math.abs(moveX) > 0.1 || Math.abs(moveY) > 0.1) {
+                // Axis is perpendicular to stick movement
+                // Up (Y-) -> Rotate Level Down (X-)
+                // Right (X+) -> Rotate Level Left (Y- or Z- depending on view)
+                // We rotate on World Axis to feel correct relative to viewer
+                const axis = new THREE.Vector3(moveY, -moveX, 0).normalize();
+                const speed = 0.04; // Rotation speed
+                const intensity = Math.sqrt(moveX*moveX + moveY*moveY);
+                
+                if (levelMesh) {
+                    levelMesh.rotateOnWorldAxis(axis, intensity * speed);
+                }
+            }
+
+            // --- 2. Raycast Player Ship ---
+            // Cast ray from camera forward
+            const camPos = new THREE.Vector3();
+            const camDir = new THREE.Vector3();
+            camera.getWorldPosition(camPos);
+            camera.getWorldDirection(camDir);
+
+            raycaster.set(camPos, camDir);
+
+            // Intersect with Level
+            if (levelMesh) {
+                const intersects = raycaster.intersectObject(levelMesh);
+                
+                if (intersects.length > 0) {
+                    const hit = intersects[0];
+                    playerMesh.visible = true;
+                    playerMesh.position.copy(hit.point);
+                    
+                    // Align ship up-vector to surface normal
+                    const n = hit.face.normal.clone().transformDirection(levelMesh.matrixWorld);
+                    const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0), n);
+                    playerMesh.quaternion.slerp(q, 0.5); // Smooth alignment
+                } else {
+                    // If looking away from shape, hide cursor
+                    playerMesh.visible = false;
+                }
+            }
+
+            // --- 3. Update Enemies ---
+            enemies.forEach(e => {
+                e.mesh.position.add(e.velocity);
+                // Random walk change
+                if(Math.random() < 0.05) {
+                    e.velocity.add(new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).multiplyScalar(0.002));
+                    e.velocity.normalize().multiplyScalar(0.005);
+                }
+                snapToSurface(e.mesh);
+            });
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
