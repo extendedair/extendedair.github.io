@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Independent Ship Movement</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+    </style>
+</head>
+<body>
+    <!-- Load Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+        let camera, scene, renderer;
+        let levelMesh, playerMesh;
+        
+        // Level Definitions
+        const CAPSULE_RADIUS = 0.15;
+        const CAPSULE_LENGTH = 0.4;
+
+        init();
+
+        function init() {
+            // 1. Scene
+            scene = new THREE.Scene();
+            scene.background = null;
+
+            // 2. Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 3. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. AR Button
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            // 5. Lights
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // 6. Create Objects
+            createStaticLevel();
+            createPlayer();
+
+            // 7. Controllers (For input polling)
+            const controller1 = renderer.xr.getController(0);
+            scene.add(controller1);
+
+            // 8. Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        function createStaticLevel() {
+            const group = new THREE.Group();
+
+            // Geometry: Standard Capsule is vertical (Y-axis)
+            const geometry = new THREE.CapsuleGeometry(CAPSULE_RADIUS, CAPSULE_LENGTH, 4, 8);
+            
+            // Material: Blue, Cell-shaded style
+            const material = new THREE.MeshPhongMaterial({ 
+                color: 0x0044ff,
+                shininess: 30,
+                flatShading: true,
+                polygonOffset: true,
+                polygonOffsetFactor: 1, 
+                polygonOffsetUnits: 1
+            });
+            levelMesh = new THREE.Mesh(geometry, material);
+
+            // Wireframe
+            const wireGeo = new THREE.WireframeGeometry(geometry);
+            const wireMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+            levelMesh.add(new THREE.LineSegments(wireGeo, wireMat));
+            
+            // Rotate the mesh 90 degrees so it lays horizontal like a hotdog
+            levelMesh.rotation.z = Math.PI / 2;
+
+            group.add(levelMesh);
+            
+            // Position 1 meter in front
+            group.position.set(0, 0, -1);
+            scene.add(group);
+        }
+
+        function createPlayer() {
+            // Cyan Cone
+            const geo = new THREE.ConeGeometry(0.015, 0.04, 16);
+            const mat = new THREE.MeshBasicMaterial({ color: 0x00FFFF });
+            playerMesh = new THREE.Mesh(geo, mat);
+            
+            // Add Player AS A CHILD of the Level
+            // This simplifies math significantly as we can move in Local Space
+            levelMesh.add(playerMesh);
+
+            // Start position: Top of the capsule (Local X = 0, Y = 0, Z = Radius)
+            // Since capsule is Y-axis aligned in local space:
+            playerMesh.position.set(0, 0, CAPSULE_RADIUS + 0.02);
+        }
+
+        // --- CORE MOVEMENT LOGIC ---
+
+        function render() {
+            const dt = 0.016; // Approx delta time
+
+            // Poll Input
+            const session = renderer.xr.getSession();
+            let inputX = 0;
+            let inputY = 0;
+
+            if (session) {
+                for (const source of session.inputSources) {
+                    if (source.handedness === 'left' && source.gamepad) {
+                        if (source.gamepad.axes.length >= 4) {
+                            inputX = source.gamepad.axes[2];
+                            inputY = source.gamepad.axes[3];
+                        }
+                    }
+                }
+            }
+
+            // Update Player Position
+            if (playerMesh && (Math.abs(inputX) > 0.1 || Math.abs(inputY) > 0.1)) {
+                movePlayer(inputX, inputY, dt);
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        function movePlayer(x, y, dt) {
+            // We need to move the player relative to the Camera's view, but constrained to the object surface.
+            // Since player is a child of levelMesh, we do math in Local Space.
+
+            const speed = 0.5; // Meters per second
+
+            // 1. Get Current Position & Normal in Local Space
+            const currentPos = playerMesh.position.clone();
+            const centerPoint = getNearestAxisPoint(currentPos);
+            const normal = new THREE.Vector3().subVectors(currentPos, centerPoint).normalize();
+
+            // 2. Determine "Right" and "Forward" vectors for movement
+            // We want "Up" on the stick to move "Up" visually in the camera frame.
+            // We can approximate this by transforming Camera Direction into Local Space.
+            
+            const camDirWorld = new THREE.Vector3();
+            camera.getWorldDirection(camDirWorld);
+            
+            // Transform Camera Dir to Level's Local Space
+            const camDirLocal = camDirWorld.transformDirection(levelMesh.matrixWorld.clone().invert()).normalize();
+
+            // Calculate Tangent vectors
+            // Right = Cross(View, Normal)
+            const moveRight = new THREE.Vector3().crossVectors(camDirLocal, normal).normalize();
+            // Forward = Cross(Normal, Right)
+            const moveForward = new THREE.Vector3().crossVectors(normal, moveRight).normalize();
+
+            // 3. Calculate Move Vector based on inputs
+            const moveVec = new THREE.Vector3()
+                .addScaledVector(moveRight, x)     // Stick X
+                .addScaledVector(moveForward, y)   // Stick Y
+                .multiplyScalar(speed * dt);
+
+            // 4. Apply Move
+            playerMesh.position.add(moveVec);
+
+            // 5. SNAP TO SURFACE
+            // We moved linearly, so we might be inside/outside the shape.
+            // We must project back onto the capsule surface.
+            const snappedCenter = getNearestAxisPoint(playerMesh.position);
+            const snappedDir = new THREE.Vector3().subVectors(playerMesh.position, snappedCenter).normalize();
+            
+            // Set final position: Center + Direction * (Radius + hover_offset)
+            playerMesh.position.copy(snappedCenter).add(snappedDir.multiplyScalar(CAPSULE_RADIUS + 0.02));
+
+            // 6. Orient Player to Surface Normal
+            // Cone points Y-up by default. Align Y to Normal.
+            const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), snappedDir);
+            playerMesh.quaternion.slerp(q, 0.5);
+        }
+
+        // Math Helper: Find nearest point on the central line segment of a Capsule
+        function getNearestAxisPoint(point) {
+            // Standard CapsuleGeometry is aligned along the Y-axis
+            // Segment goes from -Length/2 to +Length/2
+            const halfLen = CAPSULE_LENGTH / 2;
+            
+            // Clamp Y value
+            const y = Math.max(-halfLen, Math.min(halfLen, point.y));
+            
+            // X and Z are 0 on the axis
+            return new THREE.Vector3(0, y, 0);
+        }
+
+    </script>
+</body>
+</html>
