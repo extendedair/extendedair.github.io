@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Level 1 Render</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+    </style>
+</head>
+<body>
+
+    <!-- Load Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let levelMesh;
+
+        init();
+
+        function init() {
+            // 1. Scene Setup
+            // Background must be null for Passthrough to work
+            scene = new THREE.Scene();
+            scene.background = null;
+
+            // 2. Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 3. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. AR Button
+            // 'local' reference space puts (0,0,0) at the headset's starting position
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            // 5. Lighting
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // 6. Create Level 1 (Sausage) immediately
+            createSausageLevel();
+
+            // 7. Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        function createSausageLevel() {
+            // Create a group to hold the level
+            const group = new THREE.Group();
+
+            // --- Geometry: Capsule (Sausage) ---
+            // Radius: 0.15, Length: 0.4
+            const geometry = new THREE.CapsuleGeometry(0.15, 0.4, 4, 8);
+
+            // --- A. Solid Material (Cell Shaded Look) ---
+            // We use polygonOffset to push the color back slightly, allowing the wireframe to sit on top without flickering
+            const material = new THREE.MeshPhongMaterial({ 
+                color: 0x0044ff,    // Blue
+                shininess: 30,
+                flatShading: true,
+                polygonOffset: true,
+                polygonOffsetFactor: 1, 
+                polygonOffsetUnits: 1
+            });
+            
+            levelMesh = new THREE.Mesh(geometry, material);
+
+            // --- B. Wireframe Overlay ---
+            const wireGeometry = new THREE.WireframeGeometry(geometry);
+            const wireMaterial = new THREE.LineBasicMaterial({ 
+                color: 0xffffff,    // White lines
+                linewidth: 2 
+            });
+            const wireMesh = new THREE.LineSegments(wireGeometry, wireMaterial);
+            
+            // Add wireframe as a child of the solid mesh
+            levelMesh.add(wireMesh);
+            
+            group.add(levelMesh);
+
+            // Position: 1 meter in front (Z = -1)
+            group.position.set(0, 0, -1);
+            
+            scene.add(group);
+        }
+
+        function render() {
+            // Auto-rotate the sausage so you know the app isn't frozen
+            if (levelMesh) {
+                levelMesh.rotation.x += 0.005;
+                levelMesh.rotation.y += 0.01;
+            }
+            
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
