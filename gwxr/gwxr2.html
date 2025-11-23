@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>WebXR Geometry Shooter</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        /* Minimal styling, just black background for the loading page */
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; }
+    </style>
+</head>
+<body>
+    <!-- Import Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+        // ==========================================================================
+        // CONFIGURATION
+        // ==========================================================================
+        const CONFIG = {
+            baseDistance: 0.6, // Meters in front of player
+            colors: {
+                player: 0x00ffff,
+                enemy: 0xff0055,
+                boss: 0xffaa00,
+                bulletPlayer: 0x00ffff,
+                bulletEnemy: 0xffaa00,
+                shape1: 0x0044ff,
+                shape2: 0xaaaaaa,
+                shape3: 0x888888
+            }
+        };
+
+        const STATE = { PLAYING: 1, BOSS: 2, GAMEOVER: 3 };
+
+        // ==========================================================================
+        // GLOBALS
+        // ==========================================================================
+        let currentState = STATE.PLAYING;
+        let level = 1;
+        let score = 0;
+        let lives = 3;
+        let levelTime = 10;
+        
+        let camera, scene, renderer;
+        let controller1, controller2;
+        let gameGroup, worldMesh, worldWire;
+        let raycaster = new THREE.Raycaster();
+        
+        let audioManager, particleSystem, uiTexture, uiContext;
+
+        // Entities
+        const bullets = [];
+        const enemies = [];
+        const enemyBullets = [];
+
+        // Input State
+        const input = {
+            move: new THREE.Vector2(),
+            shoot: new THREE.Vector2(),
+            trigger: false
+        };
+
+        // ==========================================================================
+        // AUDIO SYSTEM
+        // ==========================================================================
+        class AudioManager {
+            constructor() {
+                this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+                this.master = this.ctx.createGain();
+                this.master.gain.value = 0.3;
+                this.master.connect(this.ctx.destination);
+            }
+
+            resume() {
+                if (this.ctx.state === 'suspended') this.ctx.resume();
+            }
+
+            playTone(freq, type, duration, vol = 1) {
+                this.resume();
+                const osc = this.ctx.createOscillator();
+                const gain = this.ctx.createGain();
+                osc.type = type;
+                osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(freq * 0.5, this.ctx.currentTime + duration);
+                gain.gain.setValueAtTime(vol, this.ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + duration);
+                osc.connect(gain);
+                gain.connect(this.master);
+                osc.start();
+                osc.stop(this.ctx.currentTime + duration);
+            }
+
+            playNoise(duration, vol = 1, filterFreq = 1000) {
+                this.resume();
+                const bufferSize = this.ctx.sampleRate * duration;
+                const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
+                const data = buffer.getChannelData(0);
+                for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+
+                const noise = this.ctx.createBufferSource();
+                noise.buffer = buffer;
+                const gain = this.ctx.createGain();
+                const filter = this.ctx.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.value = filterFreq;
+
+                gain.gain.setValueAtTime(vol, this.ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + duration);
+                
+                noise.connect(filter);
+                filter.connect(gain);
+                gain.connect(this.master);
+                noise.start();
+            }
+
+            playShoot() { this.playTone(800, 'square', 0.1, 0.4); }
+            playEnemyExplode() { this.playNoise(0.3, 0.6, 800); }
+            playPlayerExplode() { this.playNoise(1.0, 1.0, 300); }
+            
+            startSiren() {
+                this.resume();
+                if (this.sirenOsc) return;
+                this.sirenOsc = this.ctx.createOscillator();
+                this.sirenGain = this.ctx.createGain();
+                this.sirenOsc.type = 'sawtooth';
+                this.sirenOsc.frequency.value = 100;
+                this.sirenGain.gain.value = 0.1;
+                this.sirenOsc.connect(this.sirenGain);
+                this.sirenGain.connect(this.master);
+                this.sirenOsc.start();
+                
+                this.lfo = this.ctx.createOscillator();
+                this.lfo.frequency.value = 0.5;
+                const lfoGain = this.ctx.createGain();
+                lfoGain.gain.value = 50;
+                this.lfo.connect(lfoGain);
+                lfoGain.connect(this.sirenOsc.frequency);
+                this.lfo.start();
+            }
+
+            stopSiren() {
+                if (this.sirenOsc) {
+                    this.sirenOsc.stop();
+                    this.lfo.stop();
+                    this.sirenOsc = null;
+                }
+            }
+        }
+
+        // ==========================================================================
+        // INITIALIZATION
+        // ==========================================================================
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+            document.body.appendChild(renderer.domElement);
+
+            // AR Button
+            const arButton = ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] });
+            document.body.appendChild(arButton);
+
+            // Audio & Particles
+            audioManager = new AudioManager();
+            particleSystem = new ParticleSystem();
+
+            // Lighting
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 5);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // Game Container (The world sits here)
+            gameGroup = new THREE.Group();
+            gameGroup.position.set(0, 0, -CONFIG.baseDistance);
+            scene.add(gameGroup);
+
+            // Player Ship (Visual only, raycasted onto surface)
+            const shipGeo = new THREE.ConeGeometry(0.01, 0.03, 8);
+            shipGeo.rotateX(Math.PI / 2);
+            const shipMat = new THREE.MeshBasicMaterial({ color: CONFIG.colors.player });
+            window.playerMesh = new THREE.Mesh(shipGeo, shipMat);
+            scene.add(window.playerMesh);
+
+            // Controllers
+            controller1 = renderer.xr.getController(0);
+            controller2 = renderer.xr.getController(1);
+            scene.add(controller1);
+            scene.add(controller2);
+
+            const controllerModelFactory = new XRControllerModelFactory();
+            const grip1 = renderer.xr.getControllerGrip(0);
+            grip1.add(controllerModelFactory.createControllerModel(grip1));
+            scene.add(grip1);
+            const grip2 = renderer.xr.getControllerGrip(1);
+            grip2.add(controllerModelFactory.createControllerModel(grip2));
+            scene.add(grip2);
+
+            setupUI();
+
+            // Auto-Start Logic when Session Begins
+            renderer.xr.addEventListener('sessionstart', () => {
+                startGame();
+            });
+
+            renderer.setAnimationLoop(render);
+        }
+
+        // ==========================================================================
+        // GAME LOGIC
+        // ==========================================================================
+        function startGame() {
+            score = 0;
+            lives = 3;
+            level = 1;
+            startLevel();
+        }
+
+        function startLevel() {
+            currentState = STATE.PLAYING;
+            levelTime = 10.0;
+            generateLevelShape(level);
+            
+            // Cleanup old entities
+            enemies.forEach(e => gameGroup.remove(e.mesh));
+            bullets.forEach(b => gameGroup.remove(b.mesh));
+            enemyBullets.forEach(b => gameGroup.remove(b.mesh));
+            enemies.length = 0;
+            bullets.length = 0;
+            enemyBullets.length = 0;
+
+            audioManager.stopSiren();
+        }
+
+        function startBoss() {
+            currentState = STATE.BOSS;
+            levelTime = 10.0; // Boss fight duration limit (or survive time)
+            audioManager.startSiren();
+            spawnBoss();
+        }
+
+        function generateLevelShape(lvl) {
+            if (worldMesh) {
+                gameGroup.remove(worldMesh);
+                worldMesh.geometry.dispose();
+            }
+
+            let geometry, color;
+            const type = (lvl - 1) % 3;
+
+            if (type === 0) { // Sausage/Capsule
+                geometry = new THREE.CapsuleGeometry(0.15, 0.4, 4, 8);
+                color = CONFIG.colors.shape1;
+            } else if (type === 1) { // Sphere/Icosa
+                geometry = new THREE.IcosahedronGeometry(0.25, 2);
+                color = CONFIG.colors.shape2;
+            } else { // Torus
+                geometry = new THREE.TorusGeometry(0.2, 0.08, 16, 32);
+                color = CONFIG.colors.shape3;
+            }
+
+            const material = new THREE.MeshPhongMaterial({ 
+                color: color, 
+                shininess: 30,
+                polygonOffset: true, 
+                polygonOffsetFactor: 1 
+            });
+            
+            worldMesh = new THREE.Mesh(geometry, material);
+            const wireGeo = new THREE.WireframeGeometry(geometry);
+            const wireMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+            worldMesh.add(new THREE.LineSegments(wireGeo, wireMat));
+            
+            gameGroup.add(worldMesh);
+        }
+
+        // ==========================================================================
+        // CLASSES
+        // ==========================================================================
+        class Bullet {
+            constructor(position, velocity, isEnemy) {
+                this.life = 1.5;
+                this.velocity = velocity;
+                this.isEnemy = isEnemy;
+                
+                const geo = new THREE.SphereGeometry(0.008);
+                const mat = new THREE.MeshBasicMaterial({ 
+                    color: isEnemy ? CONFIG.colors.bulletEnemy : CONFIG.colors.bulletPlayer 
+                });
+                this.mesh = new THREE.Mesh(geo, mat);
+                this.mesh.position.copy(position);
+                gameGroup.add(this.mesh);
+            }
+            update(dt) {
+                this.life -= dt;
+                this.mesh.position.addScaledVector(this.velocity, dt);
+                return this.life > 0;
+            }
+        }
+
+        class Enemy {
+            constructor(isBoss) {
+                this.isBoss = isBoss;
+                this.hp = isBoss ? level + 5 : 1;
+                this.shootTimer = 2.0;
+                
+                const size = isBoss ? 0.06 : 0.02;
+                const geo = new THREE.OctahedronGeometry(size);
+                const mat = new THREE.MeshBasicMaterial({ 
+                    color: isBoss ? CONFIG.colors.boss : CONFIG.colors.enemy, 
+                    wireframe: true 
+                });
+                this.mesh = new THREE.Mesh(geo, mat);
+                
+                // Spawn on random surface point
+                const dir = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
+                const caster = new THREE.Raycaster(new THREE.Vector3(0,0,0), dir);
+                const intersects = caster.intersectObject(worldMesh);
+                if(intersects.length > 0) this.mesh.position.copy(intersects[0].point);
+                else this.mesh.position.copy(dir.multiplyScalar(0.25));
+                
+                gameGroup.add(this.mesh);
+            }
+
+            update(dt, playerPos) {
+                // Move toward player
+                const speed = this.isBoss ? 0.05 : 0.1;
+                const dir = new THREE.Vector3().copy(playerPos).sub(this.mesh.position).normalize();
+                this.mesh.position.addScaledVector(dir, speed * dt);
+                
+                // Snap to surface
+                const centerDir = new THREE.Vector3().copy(this.mesh.position).normalize().negate();
+                const rayOrigin = new THREE.Vector3().copy(this.mesh.position).addScaledVector(centerDir, -0.2);
+                const caster = new THREE.Raycaster(rayOrigin, centerDir);
+                const hits = caster.intersectObject(worldMesh);
+                if(hits.length > 0) this.mesh.position.copy(hits[0].point);
+
+                // Shoot
+                this.shootTimer -= dt;
+                if(this.shootTimer <= 0) {
+                    const count = this.isBoss ? level + 5 : level + 2;
+                    for(let i=0; i<Math.min(count, 4); i++) {
+                        const bDir = new THREE.Vector3().copy(dir);
+                        bDir.x += (Math.random()-0.5)*0.5;
+                        bDir.y += (Math.random()-0.5)*0.5;
+                        bDir.normalize();
+                        enemyBullets.push(new Bullet(this.mesh.position, bDir.multiplyScalar(0.2), true));
+                    }
+                    this.shootTimer = 2.0;
+                }
+            }
+        }
+
+        function spawnBoss() {
+            enemies.push(new Enemy(true));
+        }
+
+        class ParticleSystem {
+            constructor() {
+                this.particles = [];
+                this.geometry = new THREE.BufferGeometry();
+                this.material = new THREE.PointsMaterial({ size: 0.01, vertexColors: true });
+                this.mesh = new THREE.Points(this.geometry, this.material);
+                scene.add(this.mesh);
+            }
+            explode(pos, hex, count) {
+                const col = new THREE.Color(hex);
+                for(let i=0; i<count; i++) {
+                    this.particles.push({
+                        p: pos.clone(),
+                        v: new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize().multiplyScalar(Math.random()*0.5),
+                        l: 1.0,
+                        c: col
+                    });
+                }
+            }
+            update(dt) {
+                const posArr = [], colArr = [];
+                for(let i=this.particles.length-1; i>=0; i--) {
+                    const p = this.particles[i];
+                    p.l -= dt * 2;
+                    p.p.addScaledVector(p.v, dt);
+                    if(p.l <= 0) this.particles.splice(i,1);
+                    else {
+                        posArr.push(p.p.x, p.p.y, p.p.z);
+                        colArr.push(p.c.r, p.c.g, p.c.b);
+                    }
+                }
+                this.geometry.setAttribute('position', new THREE.Float32BufferAttribute(posArr, 3));
+                this.geometry.setAttribute('color', new THREE.Float32BufferAttribute(colArr, 3));
+            }
+        }
+
+        // ==========================================================================
+        // UI
+        // ==========================================================================
+        function setupUI() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 256;
+            uiContext = canvas.getContext('2d');
+            uiTexture = new THREE.CanvasTexture(canvas);
+            const mesh = new THREE.Mesh(
+                new THREE.PlaneGeometry(0.4, 0.2),
+                new THREE.MeshBasicMaterial({ map: uiTexture, transparent: true, opacity: 0.9 })
+            );
+            mesh.position.set(0, 0.35, -1);
+            scene.add(mesh);
+        }
+
+        function updateUI() {
+            const ctx = uiContext;
+            ctx.clearRect(0,0,512,256);
+            ctx.fillStyle = 'rgba(0,0,0,0.5)';
+            ctx.fillRect(0,0,512,256);
+            ctx.font = 'bold 40px Monospace';
+            
+            if (currentState === STATE.GAMEOVER) {
+                ctx.fillStyle = '#ff0000';
+                ctx.textAlign = 'center';
+                ctx.fillText("GAME OVER", 256, 100);
+                ctx.fillStyle = '#fff';
+                ctx.fillText("Trigger to Retry", 256, 160);
+            } else {
+                ctx.fillStyle = '#0f0';
+                ctx.textAlign = 'left';
+                ctx.fillText(`SCORE: ${score}`, 20, 50);
+                ctx.fillText(`LIVES: ${lives}`, 20, 100);
+                ctx.textAlign = 'right';
+                ctx.fillText(`LVL: ${level}`, 490, 50);
+                
+                const timeStr = Math.ceil(levelTime);
+                ctx.fillStyle = currentState === STATE.BOSS ? '#fa0' : '#0ff';
+                ctx.fillText(currentState === STATE.BOSS ? `BOSS: ${timeStr}` : `WAVE: ${timeStr}`, 490, 100);
+            }
+            uiTexture.needsUpdate = true;
+        }
+
+        // ==========================================================================
+        // RENDER LOOP
+        // ==========================================================================
+        function render(timestamp, frame) {
+            const dt = 0.016;
+
+            // Input Polling
+            input.move.set(0,0);
+            input.shoot.set(0,0);
+            input.trigger = false;
+
+            const session = renderer.xr.getSession();
+            if (session && session.inputSources) {
+                for (const source of session.inputSources) {
+                    const gp = source.gamepad;
+                    if (!gp) continue;
+                    if (source.handedness === 'left' && gp.axes.length >= 4) {
+                        input.move.set(gp.axes[2], gp.axes[3]);
+                    }
+                    if (source.handedness === 'right') {
+                        if (gp.axes.length >= 4) input.shoot.set(gp.axes[2], gp.axes[3]);
+                        if (gp.buttons[0] && gp.buttons[0].pressed) input.trigger = true;
+                    }
+                }
+            }
+
+            // Game State Logic
+            if (currentState === STATE.GAMEOVER) {
+                if (input.trigger) startGame();
+            } else {
+                // 1. Rotate World (Movement)
+                if (input.move.length() > 0.1) {
+                    const axis = new THREE.Vector3(input.move.y, -input.move.x, 0).normalize();
+                    worldMesh.rotateOnWorldAxis(axis, input.move.length() * 2.0 * dt);
+                }
+
+                // 2. Align Player
+                const camPos = new THREE.Vector3();
+                const camDir = new THREE.Vector3();
+                camera.getWorldPosition(camPos);
+                camera.getWorldDirection(camDir);
+                raycaster.set(camPos, camDir);
+                const hits = raycaster.intersectObject(worldMesh);
+                
+                if (hits.length > 0) {
+                    const hit = hits[0];
+                    window.playerMesh.position.copy(hit.point);
+                    const q = new THREE.Quaternion().setFromUnitVectors(
+                        new THREE.Vector3(0,1,0), 
+                        hit.face.normal.clone().transformDirection(worldMesh.matrixWorld)
+                    );
+                    window.playerMesh.quaternion.slerp(q, 0.2);
+                }
+
+                const playerLocalPos = window.playerMesh.position.clone();
+                if (worldMesh) worldMesh.worldToLocal(playerLocalPos);
+
+                // 3. Shoot
+                if (input.shoot.length() > 0.2) {
+                    if (!window.cooldown || window.cooldown <= 0) {
+                        const worldDir = new THREE.Vector3(input.shoot.x, -input.shoot.y, 0)
+                            .applyQuaternion(camera.quaternion).normalize();
+                        const localDir = worldDir.transformDirection(worldMesh.matrixWorld.clone().invert());
+                        
+                        bullets.push(new Bullet(playerLocalPos, localDir.multiplyScalar(0.5), false));
+                        audioManager.playShoot();
+                        window.cooldown = 0.15;
+                    }
+                }
+                if (window.cooldown > 0) window.cooldown -= dt;
+
+                // 4. Update Entities
+                // Spawn Enemies
+                if (enemies.length < level + 3 && currentState === STATE.PLAYING && Math.random() < 0.02) {
+                    enemies.push(new Enemy(false));
+                }
+
+                // Update Bullets
+                for (let i = bullets.length-1; i>=0; i--) {
+                    const b = bullets[i];
+                    if (!b.update(dt)) {
+                        gameGroup.remove(b.mesh);
+                        bullets.splice(i,1);
+                        continue;
+                    }
+                    // Hit Enemy?
+                    let hit = false;
+                    for (let j=enemies.length-1; j>=0; j--) {
+                        const e = enemies[j];
+                        if (b.mesh.position.distanceTo(e.mesh.position) < (e.isBoss ? 0.08 : 0.03)) {
+                            e.hp--;
+                            particleSystem.explode(b.mesh.position.clone().applyMatrix4(worldMesh.matrixWorld), CONFIG.colors.enemy, 10);
+                            if (e.hp <= 0) {
+                                audioManager.playEnemyExplode();
+                                particleSystem.explode(e.mesh.position.clone().applyMatrix4(worldMesh.matrixWorld), CONFIG.colors.enemy, 30);
+                                gameGroup.remove(e.mesh);
+                                enemies.splice(j,1);
+                                score += 10;
+                                if (currentState === STATE.BOSS) {
+                                    level++;
+                                    startLevel();
+                                }
+                            } else {
+                                audioManager.playTone(200, 'sawtooth', 0.1);
+                            }
+                            gameGroup.remove(b.mesh);
+                            bullets.splice(i,1);
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if(hit) continue;
+                }
+
+                // Update Enemies & Enemy Bullets
+                enemyBullets.forEach((b, i) => {
+                    if(!b.update(dt) || b.mesh.position.distanceTo(playerLocalPos) < 0.03) {
+                        if(b.mesh.position.distanceTo(playerLocalPos) < 0.03) playerHit();
+                        gameGroup.remove(b.mesh);
+                        enemyBullets.splice(i,1);
+                    }
+                });
+
+                enemies.forEach((e, i) => {
+                    e.update(dt, playerLocalPos);
+                    if(e.mesh.position.distanceTo(playerLocalPos) < 0.04) {
+                         playerHit();
+                         if(!e.isBoss) {
+                             gameGroup.remove(e.mesh);
+                             enemies.splice(i,1);
+                         }
+                    }
+                });
+
+                // Timers
+                levelTime -= dt;
+                if (levelTime <= 0 && currentState === STATE.PLAYING) startBoss();
+                
+                particleSystem.update(dt);
+            }
+            updateUI();
+            renderer.render(scene, camera);
+        }
+
+        function playerHit() {
+            lives--;
+            audioManager.playPlayerExplode();
+            particleSystem.explode(window.playerMesh.position, CONFIG.colors.player, 50);
+            if(lives <= 0) {
+                currentState = STATE.GAMEOVER;
+                audioManager.stopSiren();
+            }
+        }
+
+        init();
+    </script>
+</body>
+</html>
