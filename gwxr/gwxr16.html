@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Sphere World</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+        #overlay {
+            position: absolute; bottom: 20px; width: 100%; 
+            text-align: center; color: #0ff; font-family: monospace;
+            pointer-events: none; text-shadow: 1px 1px 0 #000;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">Left Stick: Rotate Sphere</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let worldGroup;  // Stationary container
+        let levelSphere; // The rotating world
+        let playerMesh;  // The static ship
+        
+        // Config
+        const SPHERE_RADIUS = 0.25;
+
+        init();
+
+        function init() {
+            // 1. Scene
+            scene = new THREE.Scene();
+            scene.background = null;
+
+            // 2. Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 3. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. AR Button
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            // 5. Lights
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            // 6. Create Objects
+            buildGameWorld();
+
+            // 7. Controllers
+            const controller1 = renderer.xr.getController(0);
+            scene.add(controller1);
+
+            // 8. Loop
+            renderer.setAnimationLoop(render);
+        }
+
+        function buildGameWorld() {
+            worldGroup = new THREE.Group();
+            worldGroup.position.set(0, 0, -1);
+            scene.add(worldGroup);
+
+            // --- 1. The Level (Death Star Style Sphere) ---
+            levelSphere = new THREE.Group();
+
+            // A. Main Sphere Body
+            const geometry = new THREE.SphereGeometry(SPHERE_RADIUS, 32, 32);
+            const material = new THREE.MeshPhongMaterial({ 
+                color: 0x888888, // Grey
+                shininess: 10,
+                flatShading: false,
+                polygonOffset: true,
+                polygonOffsetFactor: 1, 
+                polygonOffsetUnits: 1
+            });
+            const mainMesh = new THREE.Mesh(geometry, material);
+            
+            // Wireframe Overlay
+            const wireGeo = new THREE.WireframeGeometry(geometry);
+            const wireMat = new THREE.LineBasicMaterial({ color: 0x444444, linewidth: 1 });
+            mainMesh.add(new THREE.LineSegments(wireGeo, wireMat));
+            
+            levelSphere.add(mainMesh);
+
+            // B. Equator Trench (Ring)
+            const eqGeo = new THREE.TorusGeometry(SPHERE_RADIUS, 0.005, 16, 64);
+            const eqMat = new THREE.MeshBasicMaterial({ color: 0x222222 }); // Dark Grey
+            const equator = new THREE.Mesh(eqGeo, eqMat);
+            // Rotate to lie flat on XZ plane (if sphere Y is up) -> Actually standard Torus is XY plane
+            equator.rotation.x = Math.PI / 2;
+            levelSphere.add(equator);
+
+            // C. The Dish (Superlaser)
+            // A slightly smaller circle sitting on the surface
+            const dishGeo = new THREE.CircleGeometry(0.06, 32);
+            const dishMat = new THREE.MeshBasicMaterial({ color: 0x444444, side: THREE.DoubleSide });
+            const dish = new THREE.Mesh(dishGeo, dishMat);
+            
+            // Position on upper hemisphere
+            // Vector calculation: Up and slightly forward
+            const dishPos = new THREE.Vector3(0, 0.5, 0.5).normalize().multiplyScalar(SPHERE_RADIUS + 0.002);
+            dish.position.copy(dishPos);
+            
+            // Look at center of sphere (to align with surface), then flip
+            dish.lookAt(0,0,0);
+            
+            // Add a Rim to the dish
+            const dishRimGeo = new THREE.TorusGeometry(0.06, 0.002, 16, 32);
+            const dishRimMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+            const dishRim = new THREE.Mesh(dishRimGeo, dishRimMat);
+            dish.add(dishRim); // Add rim to dish
+
+            levelSphere.add(dish);
+
+            // Add Level to World
+            worldGroup.add(levelSphere);
+
+
+            // --- 2. The Player (Static Ship) ---
+            // Sibling of levelSphere, Child of worldGroup.
+            // It does NOT rotate when levelSphere rotates.
+            const pGeo = new THREE.SphereGeometry(0.02, 16, 16);
+            pGeo.scale(1, 0.4, 1); // Flatten
+            const pMat = new THREE.MeshBasicMaterial({ color: 0x00FFFF });
+            playerMesh = new THREE.Mesh(pGeo, pMat);
+
+            // Position: Fixed at Radius + Offset
+            // Z-forward is towards camera in this setup usually, but let's place it 
+            // at (0, 0, Radius) relative to the group center.
+            playerMesh.position.set(0, 0, SPHERE_RADIUS + 0.01);
+            
+            // Rotate to face camera
+            playerMesh.rotation.x = Math.PI / 2;
+
+            worldGroup.add(playerMesh);
+        }
+
+        function render() {
+            const dt = 0.016;
+
+            // --- Input ---
+            const session = renderer.xr.getSession();
+            let inputX = 0; 
+            let inputY = 0; 
+
+            if (session) {
+                for (const source of session.inputSources) {
+                    if (source.handedness === 'left' && source.gamepad) {
+                        const gp = source.gamepad;
+                        if (gp.axes.length >= 4) {
+                            inputX = gp.axes[2];
+                            inputY = gp.axes[3];
+                        }
+                    }
+                }
+            }
+
+            // --- Rotation Logic (Previous Working Method) ---
+            // Because the shape is a sphere, we can just rotate the sphere object 
+            // around the world axes. The static player at (0,0,Radius) will always
+            // be exactly on the surface. No Raycasting needed.
+
+            const rotSpeed = 2.0 * dt;
+
+            if (Math.abs(inputX) > 0.1 || Math.abs(inputY) > 0.1) {
+                // Pitch (Up/Down) -> Rotate X
+                if (Math.abs(inputY) > 0.1) {
+                    levelSphere.rotateOnWorldAxis(new THREE.Vector3(1, 0, 0), inputY * rotSpeed);
+                }
+                // Yaw (Left/Right) -> Rotate Y
+                if (Math.abs(inputX) > 0.1) {
+                    levelSphere.rotateOnWorldAxis(new THREE.Vector3(0, 1, 0), inputX * rotSpeed);
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+    </script>
+</body>
+</html>
