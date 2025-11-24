@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>MR Twin-Stick Pro Controls</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background-color: #000; overflow: hidden; }
+        #overlay {
+            position: absolute; bottom: 20px; width: 100%; 
+            text-align: center; color: #0ff; font-family: monospace;
+            pointer-events: none; text-shadow: 1px 1px 0 #000;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">L-Stick: Fly | R-Stick: Aim & Shoot</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        // --- Globals ---
+        let camera, scene, renderer;
+        let worldGroup, levelSphere, playerMesh, playerRotationAnchor;
+        
+        // Reusable Vectors to prevent GC spikes during loop
+        const V3_UP = new THREE.Vector3(0, 1, 0);
+        const V3_RIGHT = new THREE.Vector3(1, 0, 0);
+        const V3_TEMP = new THREE.Vector3();
+        
+        // Asset Store
+        const Assets = {};
+
+        // Game State
+        const SPHERE_RADIUS = 0.325;
+        let lives = 3;
+        let isInvulnerable = false;
+        let invulnerableTimer = 0;
+        let shotCooldown = 0;
+        
+        // Boss State
+        let bossTimer = 0;
+        let bossActive = false;
+        let bossEntity = null;
+        
+        // Entities
+        const enemies = []; 
+        const playerBullets = [];
+        const enemyBullets = [];
+        const bossBullets = [];
+        const particles = [];
+
+        // Audio
+        const audio = new SoundManager();
+
+        init();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = null;
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 5, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            initAssets();
+            buildGameWorld();
+
+            scene.add(renderer.xr.getController(0));
+            scene.add(renderer.xr.getController(1));
+
+            renderer.setAnimationLoop(render);
+        }
+
+        function initAssets() {
+            Assets.pBulletGeo = new THREE.SphereGeometry(0.006, 8, 8);
+            Assets.pBulletMat = new THREE.MeshBasicMaterial({ color: 0xAAFFFF });
+            Assets.eBulletGeo = new THREE.SphereGeometry(0.008, 8, 8);
+            Assets.eBulletMat = new THREE.MeshBasicMaterial({ color: 0xFF0000 });
+            Assets.particleGeo = new THREE.BoxGeometry(0.008, 0.008, 0.008);
+            
+            const diaGeo = new THREE.OctahedronGeometry(0.03, 0);
+            diaGeo.scale(1, 1.5, 1);
+            Assets.enemyGeo = diaGeo;
+            Assets.enemyMat = new THREE.MeshPhongMaterial({ color: 0xFF8800, flatShading: true });
+            Assets.enemyWire = new THREE.WireframeGeometry(diaGeo);
+            Assets.enemyWireMat = new THREE.LineBasicMaterial({ color: 0xFFCC00 });
+
+            Assets.bossGeo = new THREE.SphereGeometry(0.045, 24, 24);
+            Assets.bossMat = new THREE.MeshPhongMaterial({ color: 0xFF0000, flatShading: true });
+            Assets.bossWire = new THREE.WireframeGeometry(Assets.bossGeo);
+        }
+
+        function SoundManager() {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const gain = ctx.createGain();
+            gain.gain.value = 0.1; 
+            gain.connect(ctx.destination);
+            let sirenOsc = null, lfo = null;
+
+            this.resume = () => { if(ctx.state === 'suspended') ctx.resume(); };
+            this.playNoise = (dur, freq, vol) => {
+                this.resume();
+                const b = ctx.createBuffer(1, ctx.sampleRate*dur, ctx.sampleRate);
+                const d = b.getChannelData(0);
+                for(let i=0; i<d.length; i++) d[i] = Math.random()*2-1;
+                const src = ctx.createBufferSource();
+                src.buffer = b;
+                const g = ctx.createGain();
+                const f = ctx.createBiquadFilter();
+                f.type = 'lowpass'; f.frequency.value = freq;
+                g.gain.setValueAtTime(vol, ctx.currentTime);
+                g.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime+dur);
+                src.connect(f); f.connect(g); g.connect(gain);
+                src.start();
+            };
+            this.shoot = () => {
+                this.resume();
+                const o = ctx.createOscillator();
+                const g = ctx.createGain();
+                o.type = 'square';
+                o.frequency.setValueAtTime(600, ctx.currentTime);
+                o.frequency.exponentialRampToValueAtTime(100, ctx.currentTime + 0.1);
+                g.gain.setValueAtTime(0.1, ctx.currentTime);
+                g.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
+                o.connect(g); g.connect(gain);
+                o.start(); o.stop(ctx.currentTime + 0.1);
+            };
+            this.explode = () => this.playNoise(0.3, 1000, 0.2);
+            this.bossExplode = () => this.playNoise(1.0, 300, 0.6); 
+            this.startSiren = () => {
+                if(sirenOsc) return;
+                this.resume();
+                sirenOsc = ctx.createOscillator();
+                sirenOsc.type = 'sawtooth'; sirenOsc.frequency.value = 150;
+                lfo = ctx.createOscillator(); lfo.frequency.value = 2;
+                const lg = ctx.createGain(); lg.gain.value = 50;
+                const sg = ctx.createGain(); sg.gain.value = 0.05;
+                lfo.connect(lg); lg.connect(sirenOsc.frequency);
+                sirenOsc.connect(sg); sg.connect(gain);
+                sirenOsc.start(); lfo.start();
+            };
+            this.stopSiren = () => {
+                if(sirenOsc) { sirenOsc.stop(); sirenOsc=null; lfo.stop(); }
+            };
+        }
+
+        function createHeroShip() {
+            const group = new THREE.Group();
+            const matBlue = new THREE.MeshPhongMaterial({ color: 0x0044ff, flatShading: true, polygonOffset: true, polygonOffsetFactor: 1 });
+            const matWire = new THREE.LineBasicMaterial({ color: 0xffffff });
+
+            function addPart(geo, x, y, z, rotX=0) {
+                const mesh = new THREE.Mesh(geo, matBlue);
+                mesh.add(new THREE.LineSegments(new THREE.WireframeGeometry(geo), matWire));
+                mesh.position.set(x,y,z);
+                if(rotX) mesh.rotation.x = rotX;
+                group.add(mesh);
+            }
+
+            // Nose points to +Z in local space
+            addPart(new THREE.CapsuleGeometry(0.01, 0.06, 4, 8), 0, 0, 0, Math.PI/2);
+            addPart(new THREE.CapsuleGeometry(0.005, 0.04, 4, 8), -0.02, 0, 0, Math.PI/2);
+            addPart(new THREE.CapsuleGeometry(0.005, 0.04, 4, 8), 0.02, 0, 0, Math.PI/2);
+            addPart(new THREE.BoxGeometry(0.05, 0.002, 0.015), 0, 0, 0);
+
+            group.scale.set(0.7, 0.7, 0.7);
+            return group;
+        }
+
+        function buildGameWorld() {
+            worldGroup = new THREE.Group();
+            worldGroup.position.set(0, 0, -1);
+            scene.add(worldGroup);
+
+            levelSphere = new THREE.Group();
+            const mainMesh = new THREE.Mesh(
+                new THREE.SphereGeometry(SPHERE_RADIUS, 48, 48),
+                new THREE.MeshPhongMaterial({ color: 0x888888, shininess: 10, polygonOffset: true, polygonOffsetFactor: 1 })
+            );
+            mainMesh.add(new THREE.LineSegments(new THREE.WireframeGeometry(mainMesh.geometry), new THREE.LineBasicMaterial({ color: 0x444444 })));
+            levelSphere.add(mainMesh);
+            
+            const eq = new THREE.Mesh(new THREE.TorusGeometry(SPHERE_RADIUS, 0.008, 16, 100), new THREE.MeshBasicMaterial({ color: 0x111111 }));
+            eq.rotation.x = Math.PI/2;
+            levelSphere.add(eq);
+
+            const dishGrp = new THREE.Group();
+            dishGrp.add(new THREE.Mesh(new THREE.CircleGeometry(0.08, 32), new THREE.MeshBasicMaterial({color:0x444444, side:2})));
+            dishGrp.add(new THREE.Mesh(new THREE.TorusGeometry(0.06, 0.002, 16, 32), new THREE.MeshBasicMaterial({color:0x000})));
+            const spk = new THREE.Mesh(new THREE.ConeGeometry(0.005, 0.04, 8), new THREE.MeshBasicMaterial({color:0x222}));
+            spk.rotation.x = Math.PI/2;
+            dishGrp.add(spk);
+            dishGrp.position.set(0, 0.6, 0.5).normalize().multiplyScalar(SPHERE_RADIUS+0.002);
+            dishGrp.lookAt(0,0,0);
+            levelSphere.add(dishGrp);
+
+            worldGroup.add(levelSphere);
+
+            // Player Anchor (-90 X rot so Z is forward relative to camera view)
+            playerRotationAnchor = new THREE.Group();
+            playerRotationAnchor.position.set(0, 0, SPHERE_RADIUS + 0.02);
+            playerRotationAnchor.rotation.x = -Math.PI/2; 
+            
+            playerMesh = createHeroShip();
+            playerRotationAnchor.add(playerMesh);
+            worldGroup.add(playerRotationAnchor);
+
+            for(let i=0; i<8; i++) spawnEnemy();
+        }
+
+        function spawnEnemy() {
+            const grp = new THREE.Group();
+            const mesh = new THREE.Mesh(Assets.enemyGeo, Assets.enemyMat);
+            mesh.rotation.x = Math.PI/2;
+            mesh.add(new THREE.LineSegments(Assets.enemyWire, Assets.enemyWireMat));
+            grp.add(mesh);
+
+            levelSphere.add(grp);
+            const pos = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize().multiplyScalar(SPHERE_RADIUS + 0.02);
+            grp.position.copy(pos);
+            const t = new THREE.Vector3().crossVectors(pos.clone().normalize(), new THREE.Vector3(Math.random(),Math.random(),Math.random())).normalize();
+            
+            enemies.push({ mesh: grp, velocity: t.multiplyScalar(0.2), bullets: [], shootTimer: Math.random() * 2 });
+        }
+
+        function spawnBoss() {
+            bossActive = true;
+            audio.startSiren();
+            const grp = new THREE.Group();
+            const mesh = new THREE.Mesh(Assets.bossGeo, Assets.bossMat.clone());
+            mesh.add(new THREE.LineSegments(Assets.bossWire, new THREE.LineBasicMaterial({ color: 0xFFFFFF })));
+            // Spikes
+            const sg = new THREE.ConeGeometry(0.005, 0.02, 8);
+            const sm = new THREE.MeshBasicMaterial({color:0x000});
+            for(let i=0; i<6; i++) {
+                const s = new THREE.Mesh(sg, sm);
+                if(i<4) { s.rotation.x=Math.PI/2; s.rotation.z=(Math.PI/2)*i; s.translateY(0.045); }
+                else { s.translateY(i===4?0.045:-0.045); }
+                mesh.add(s);
+            }
+            grp.add(mesh);
+            levelSphere.add(grp);
+            grp.position.set(0,0,-1).normalize().multiplyScalar(SPHERE_RADIUS+0.04);
+            bossEntity = { mesh: grp, hp: 3, shootTimer: 0 };
+        }
+
+        function despawnBoss(explode) {
+            bossActive = false;
+            audio.stopSiren();
+            if(bossEntity) {
+                levelSphere.remove(bossEntity.mesh);
+                if(explode) {
+                    createExplosion(bossEntity.mesh.position, 0xFFFFFF, 30);
+                    audio.bossExplode();
+                }
+                bossEntity = null;
+            }
+        }
+
+        function spawnBullet(isPlayer, origin, owner) {
+            const list = isPlayer ? playerBullets : (owner === bossEntity ? bossBullets : enemyBullets);
+            const limit = isPlayer ? 10 : (owner === bossEntity ? 8 : 1);
+            if (list.length >= limit) return;
+
+            const mesh = new THREE.Mesh(isPlayer ? Assets.pBulletGeo : Assets.eBulletGeo, isPlayer ? Assets.pBulletMat : Assets.eBulletMat);
+            
+            const pLocal = playerMesh.getWorldPosition(V3_TEMP);
+            levelSphere.worldToLocal(pLocal);
+            
+            let pos, dir;
+            if (isPlayer) {
+                pos = pLocal.clone();
+                // Fire in direction the SHIP IS FACING (Local Z of ship)
+                const shipQuat = playerMesh.getWorldQuaternion(new THREE.Quaternion());
+                const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(shipQuat);
+                dir = forward.transformDirection(levelSphere.matrixWorld.clone().invert()).normalize();
+            } else {
+                pos = origin.clone();
+                dir = new THREE.Vector3().subVectors(pLocal, pos).normalize();
+            }
+
+            mesh.position.copy(pos);
+            levelSphere.add(mesh);
+            list.push({ mesh, velocity: dir.multiplyScalar(isPlayer ? 0.6 : 0.3), life: 2.0 });
+            
+            if(isPlayer) audio.shoot();
+        }
+
+        function createExplosion(pos, color, count=12) {
+            if(count===12) audio.explode();
+            const mat = new THREE.MeshBasicMaterial({ color: color });
+            for(let i=0; i<count; i++) {
+                const mesh = new THREE.Mesh(Assets.particleGeo, mat);
+                mesh.position.copy(pos);
+                const vel = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize().multiplyScalar(0.4);
+                levelSphere.add(mesh);
+                particles.push({ mesh, velocity: vel, life: 0.8 });
+            }
+        }
+
+        function update(dt, moveX, moveY, shotX, shotY) {
+            // --- MOVEMENT (Left Stick) ---
+            // Move Ship UP (Screen Y+) = Rotate Sphere Pitch (World X) Positive (bring top forward)
+            // Move Ship RIGHT (Screen X+) = Rotate Sphere Yaw (World Y) Negative (spin left)
+            if (Math.abs(moveX) > 0.1 || Math.abs(moveY) > 0.1) {
+                const rotSpeed = 1.4 * dt;
+                if(Math.abs(moveY)>0.1) levelSphere.rotateOnWorldAxis(V3_RIGHT, moveY * rotSpeed); 
+                if(Math.abs(moveX)>0.1) levelSphere.rotateOnWorldAxis(V3_UP, moveX * rotSpeed); 
+            }
+
+            // --- AIMING / FACING (Right Stick) ---
+            // Calculate angle. X+ is Right, Y- is Up.
+            // Atan2(y, x). 
+            // We want Up (Y-1) to be Angle 0 (or match geometry Z+).
+            // This maps the stick direction to the visual ship rotation.
+            if (Math.abs(shotX) > 0.1 || Math.abs(shotY) > 0.1) {
+                // In Anchor space: Z is Forward (Up), X is Right.
+                // Stick X is Right (1). Stick Y is Down (1).
+                // We use standard atan2(-x, y) often for this orientation.
+                // Let's test: Up (0, -1) -> atan2(0, -1) = PI (Backwards?)
+                // Up is (0, -1). We want rotation 0?
+                // Actually simpler: atan2(x, -y).
+                // Up (0, -1) -> atan2(0, 1) = 0. Correct.
+                // Right (1, 0) -> atan2(1, 0) = PI/2. Correct.
+                playerMesh.rotation.y = Math.atan2(shotX, -shotY);
+            }
+
+            // --- Game Logic ---
+            if (bossActive) {
+                bossTimer += dt;
+                bossEntity.mesh.children[0].material.color.setHSL((Date.now()%2000)/2000, 1, 0.5);
+                bossEntity.mesh.position.applyAxisAngle(V3_RIGHT, dt*0.2).normalize().multiplyScalar(SPHERE_RADIUS+0.04);
+                bossEntity.mesh.lookAt(0,0,0);
+                bossEntity.shootTimer -= dt;
+                if(bossEntity.shootTimer <= 0) { spawnBullet(false, bossEntity.mesh.position, bossEntity); bossEntity.shootTimer=0.2; }
+                if(bossTimer >= 10) { bossTimer=0; despawnBoss(false); }
+            } else {
+                bossTimer += dt;
+                if(bossTimer >= 10) { bossTimer=0; spawnBoss(); }
+            }
+
+            // Particles
+            for(let i=particles.length-1; i>=0; i--) {
+                const p=particles[i]; p.life-=dt; p.mesh.position.addScaledVector(p.velocity, dt);
+                p.mesh.scale.multiplyScalar(0.9);
+                if(p.life<=0) { levelSphere.remove(p.mesh); particles.splice(i,1); }
+            }
+
+            // Invulnerability
+            if(isInvulnerable) {
+                invulnerableTimer-=dt;
+                playerMesh.visible = (Math.floor(invulnerableTimer*10)%2===0);
+                if(invulnerableTimer<=0) { isInvulnerable=false; playerMesh.visible=true; }
+            }
+
+            const pLocal = playerMesh.getWorldPosition(V3_TEMP);
+            levelSphere.worldToLocal(pLocal);
+
+            // Enemies
+            enemies.forEach(e => {
+                e.mesh.position.addScaledVector(e.velocity, dt).normalize().multiplyScalar(SPHERE_RADIUS + 0.02);
+                const n = e.mesh.position.clone().normalize();
+                e.velocity.sub(n.multiplyScalar(e.velocity.dot(n))).normalize().multiplyScalar(0.2);
+                e.mesh.quaternion.setFromUnitVectors(V3_UP, n);
+                if(Math.random()<0.05) e.velocity.add(new THREE.Vector3(Math.random()-0.5,0,Math.random()-0.5).multiplyScalar(0.1));
+                e.shootTimer -= dt;
+                if(e.shootTimer<=0) { spawnBullet(false, e.mesh.position, e); e.shootTimer=1.0+Math.random()*2.0; }
+                if(e.mesh.position.distanceToSquared(pLocal)<0.0025 && !isInvulnerable) {
+                    lives--; isInvulnerable=true; invulnerableTimer=3; audio.explode(); if(lives<=0) lives=3;
+                }
+            });
+
+            // Bullets
+            const allBullets = [...playerBullets, ...enemyBullets, ...bossBullets];
+            playerBullets.length=0; enemyBullets.length=0; bossBullets.length=0;
+            
+            allBullets.forEach(b => {
+                const isP = (b.mesh.material === Assets.pBulletMat);
+                b.life -= dt;
+                b.mesh.position.addScaledVector(b.velocity, dt).normalize().multiplyScalar(SPHERE_RADIUS + 0.015);
+                const n = b.mesh.position.clone().normalize();
+                b.velocity.sub(n.multiplyScalar(b.velocity.dot(n))).normalize().multiplyScalar(isP?0.6:0.3);
+
+                let d = false;
+                if (isP) {
+                    for(let j=enemies.length-1; j>=0; j--) {
+                        if(b.mesh.position.distanceToSquared(enemies[j].mesh.position) < 0.003) {
+                            createExplosion(enemies[j].mesh.position, 0xFF8800);
+                            levelSphere.remove(enemies[j].mesh);
+                            enemies.splice(j,1); spawnEnemy(); d=true; break;
+                        }
+                    }
+                    if(!d && bossActive && b.mesh.position.distanceToSquared(bossEntity.mesh.position)<0.008) {
+                        audio.explode(); bossEntity.hp--; if(bossEntity.hp<=0) { despawnBoss(true); bossTimer=0; } d=true;
+                    }
+                } else {
+                    if(b.mesh.position.distanceToSquared(pLocal)<0.002) {
+                        if(!isInvulnerable) { lives--; isInvulnerable=true; invulnerableTimer=3; audio.explode(); if(lives<=0)lives=3; }
+                        d=true;
+                    }
+                }
+                if(d||b.life<=0) levelSphere.remove(b.mesh);
+                else {
+                    if(isP) playerBullets.push(b);
+                    else if(bossActive && b.velocity.lengthSq()>0) enemyBullets.push(b); // Simplified push back (logic tweak needed for perfect sorting but fine for physics)
+                    else enemyBullets.push(b);
+                }
+            });
+        }
+
+        function render() {
+            const dt = 0.016;
+            const session = renderer.xr.getSession();
+            let moveX=0, moveY=0, shotX=0, shotY=0;
+
+            if (session) {
+                for (const source of session.inputSources) {
+                    const gp = source.gamepad;
+                    if (!gp || gp.axes.length<4) continue;
+                    if (source.handedness==='left') { moveX=gp.axes[2]; moveY=gp.axes[3]; }
+                    if (source.handedness==='right') { shotX=gp.axes[2]; shotY=gp.axes[3]; }
+                }
+            }
+
+            if (shotCooldown > 0) shotCooldown -= dt;
+            // Shoot if stick pushed
+            if ((shotX*shotX + shotY*shotY) > 0.25 && shotCooldown <= 0) {
+                spawnBullet(true, null, null);
+                shotCooldown = 0.15;
+            }
+
+            update(dt, moveX, moveY, shotX, shotY);
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
