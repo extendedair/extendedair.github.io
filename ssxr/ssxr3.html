@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Quest 3 MR: Retro Shoot'em Up Base</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; }
+        #overlay {
+            position: absolute; top: 20px; left: 0; width: 100%;
+            text-align: center; color: #00ff00; pointer-events: none; z-index: 10;
+            text-shadow: 2px 2px 0px #000; font-weight: bold; font-size: 1.2em;
+        }
+    </style>
+    <!-- Import Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="overlay">
+        RETRO MR ENGINE<br/>
+        SYSTEM: MERGING TUNNELS
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        // ============================================================================
+        // CONFIGURATION
+        // ============================================================================
+        const CONFIG = {
+            scrollSpeed: 2.5,        // Speed of movement (Right to Left)
+            spawnX: 8.0,             // Spawn off-screen Right
+            despawnX: -8.0,          // Despawn off-screen Left
+            segmentLength: 0.5,      // Length of each tunnel slice
+            viewZ: -2.5,             // Depth: How far away the tunnels are
+            
+            // Tunnel Dimensions
+            radiusMin: 0.3,
+            radiusMax: 0.7,
+            
+            // Positioning
+            topY: 0.6,
+            bottomY: -0.6,
+        };
+
+        // ============================================================================
+        // SHADER & MATERIALS
+        // ============================================================================
+        
+        // Custom Cel Shader: Blue interior, Grey edges, Banded look
+        const celShaderMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                colorInside: { value: new THREE.Color(0x0044ff) }, // Deep Blue (Center)
+                colorEdge:   { value: new THREE.Color(0x888888) }  // Grey (Edges)
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 colorInside;
+                uniform vec3 colorEdge;
+                varying vec2 vUv;
+
+                void main() {
+                    // vUv.x maps to the curve of the cylinder (0.0 to 1.0)
+                    // The "Back" of the tube is roughly the center (0.5) if mapped correctly,
+                    // or the edges depending on theta.
+                    // With our geometry setup, 0.0 is top rim, 1.0 is bottom rim (or vice versa).
+                    
+                    // We want the middle of the strip (deepest part of U) to be Blue.
+                    // The edges (rims) to be Grey.
+                    float distFromCenter = abs(vUv.x - 0.5) * 2.0; // 0.0 at center, 1.0 at edges
+                    
+                    // Cel Shading Stepping
+                    float bands = 5.0;
+                    float stepped = floor(distFromCenter * bands) / bands;
+
+                    // Mix: 0 = Inside (Blue), 1 = Edge (Grey)
+                    vec3 finalColor = mix(colorInside, colorEdge, stepped);
+
+                    // Add slight opacity gradient (edges more solid)
+                    float alpha = 0.6 + (0.4 * stepped);
+                    
+                    gl_FragColor = vec4(finalColor, alpha);
+                }
+            `,
+            transparent: true,
+            side: THREE.DoubleSide,
+            depthWrite: false // Disable depth write to allow pretty overlapping
+        });
+
+        // Wireframe Material
+        const wireframeMat = new THREE.LineBasicMaterial({ 
+            color: 0xcccccc, 
+            linewidth: 2,
+            transparent: true,
+            opacity: 0.5
+        });
+
+        // ============================================================================
+        // CLASSES
+        // ============================================================================
+
+        /**
+         * A single slice of the tunnel.
+         */
+        class TunnelSlice {
+            constructor(position, radius, length) {
+                this.group = new THREE.Group();
+
+                // 1. Geometry Construction
+                // We want a "U" shape facing the camera.
+                // CylinderGeometry: radiusTop, radiusBottom, height, radialSegments, heightSegments, openEnded, thetaStart, thetaLength
+                
+                // thetaLength = PI makes it a half-tube.
+                // thetaStart = PI makes the mesh generate on the "back" side relative to standard rotation.
+                const geo = new THREE.CylinderGeometry(radius, radius, length, 12, 1, true, Math.PI, Math.PI);
+
+                // 2. Rotate Geometry to correct orientation
+                // Standard Cylinder is Y-up.
+                // We want it to run along X (Left-Right). -> Rotate Z 90.
+                // We want the "Open" face to look at +Z (Camera). 
+                // The parameters (PI, PI) combined with this rotation align the "Back" to -Z and "Open" to +Z.
+                geo.rotateZ(-Math.PI / 2);
+
+                // 3. Mesh & Wireframe
+                this.mesh = new THREE.Mesh(geo, celShaderMaterial);
+                
+                // Use EdgesGeometry for a cleaner outline, or WireframeGeometry for the grid.
+                // WireframeGeometry on a low-poly cylinder gives the "Retro Grid" look nicely.
+                const wireGeo = new THREE.WireframeGeometry(geo);
+                this.wire = new THREE.LineSegments(wireGeo, wireframeMat);
+
+                this.group.add(this.mesh);
+                this.group.add(this.wire);
+
+                // 4. Set Position
+                this.group.position.copy(position);
+            }
+
+            dispose() {
+                this.mesh.geometry.dispose();
+                this.wire.geometry.dispose();
+                this.group.removeFromParent();
+            }
+        }
+
+        /**
+         * Controls the logic for where tunnels should spawn (Merge/Split logic).
+         */
+        class TunnelDirector {
+            constructor() {
+                this.time = 0;
+                this.mergeState = 0; // 0 = Split, 1 = Merged
+                this.mergeFactor = 0; // Interpolator 0.0 -> 1.0
+                
+                this.nextEventTime = 5.0; // Seconds until next state change
+            }
+
+            update(delta) {
+                this.time += delta;
+
+                // Handle State Switching
+                if (this.time > this.nextEventTime) {
+                    this.time = 0;
+                    this.nextEventTime = Math.random() * 4.0 + 3.0; // Random duration 3-7s
+                    this.mergeState = this.mergeState === 0 ? 1 : 0; // Toggle
+                }
+
+                // Smoothly interpolate the Merge Factor
+                const target = this.mergeState; // 0 or 1
+                const speed = 2.0 * delta;      // Transition speed
+                
+                if (this.mergeFactor < target) {
+                    this.mergeFactor = Math.min(this.mergeFactor + speed, 1.0);
+                } else if (this.mergeFactor > target) {
+                    this.mergeFactor = Math.max(this.mergeFactor - speed, 0.0);
+                }
+            }
+
+            // Get the Y position for a tunnel at a specific generation moment
+            getTargetY(isTopTunnel, xPos) {
+                // Base positions
+                const splitY = isTopTunnel ? CONFIG.topY : CONFIG.bottomY;
+                const mergedY = 0; // Both go to center
+
+                // Apply Merge Factor
+                let y = THREE.MathUtils.lerp(splitY, mergedY, this.mergeFactor);
+
+                // Add waviness
+                const wave = Math.sin(xPos * 0.5 + Date.now() * 0.001) * 0.2;
+                return y + wave;
+            }
+
+            // Get Radius (Width)
+            getTargetRadius(xPos) {
+                // Base noise
+                const noise = Math.sin(xPos * 1.2 + Date.now() * 0.002); // -1 to 1
+                const baseRad = THREE.MathUtils.mapLinear(noise, -1, 1, CONFIG.radiusMin, CONFIG.radiusMax);
+
+                // If merging, make them fatter so they join cleanly
+                const mergeBonus = this.mergeFactor * 0.3; 
+                
+                return baseRad + mergeBonus;
+            }
+        }
+
+        /**
+         * Manages a continuous stream of slices.
+         */
+        class TunnelStream {
+            constructor(scene, director, isTop) {
+                this.scene = scene;
+                this.director = director;
+                this.isTop = isTop;
+                this.slices = [];
+                
+                // Generation Cursor
+                this.cursorX = CONFIG.despawnX; 
+                
+                // Pre-fill screen
+                while(this.cursorX < CONFIG.spawnX) {
+                    this.spawnSlice(this.cursorX);
+                    this.cursorX += CONFIG.segmentLength;
+                }
+            }
+
+            spawnSlice(x) {
+                const y = this.director.getTargetY(this.isTop, x);
+                const r = this.director.getTargetRadius(x);
+                const pos = new THREE.Vector3(x, y, CONFIG.viewZ);
+
+                const slice = new TunnelSlice(pos, r, CONFIG.segmentLength);
+                this.scene.add(slice.group);
+                this.slices.push(slice);
+            }
+
+            update(delta, shiftAmount) {
+                // Move existing slices
+                for (let i = this.slices.length - 1; i >= 0; i--) {
+                    const slice = this.slices[i];
+                    slice.group.position.x -= shiftAmount;
+
+                    // Despawn
+                    if (slice.group.position.x < CONFIG.despawnX) {
+                        slice.dispose();
+                        this.slices.splice(i, 1);
+                    }
+                }
+
+                // Adjust cursor to world movement
+                this.cursorX -= shiftAmount;
+
+                // Spawn new
+                while(this.cursorX < CONFIG.spawnX) {
+                    this.cursorX += CONFIG.segmentLength;
+                    this.spawnSlice(this.cursorX);
+                }
+            }
+        }
+
+        // ============================================================================
+        // MAIN APP
+        // ============================================================================
+        
+        let camera, scene, renderer;
+        let director;
+        let streamTop, streamBot;
+        let clock;
+
+        init();
+        animate();
+
+        function init() {
+            // Scene Setup
+            scene = new THREE.Scene(); // Transparent background by default in AR if alpha:true
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Lighting (Helpers for wireframe depth perception)
+            const ambient = new THREE.HemisphereLight(0xffffff, 0x000000, 1);
+            scene.add(ambient);
+
+            // Logic
+            clock = new THREE.Clock();
+            director = new TunnelDirector();
+            streamTop = new TunnelStream(scene, director, true);
+            streamBot = new TunnelStream(scene, director, false);
+
+            // WebXR Button
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+            
+            window.addEventListener('resize', onResize);
+        }
+
+        function onResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function render() {
+            const delta = clock.getDelta();
+            const shift = CONFIG.scrollSpeed * delta;
+
+            // Update Director (Merge logic)
+            director.update(delta);
+
+            // Update Streams
+            streamTop.update(delta, shift);
+            streamBot.update(delta, shift);
+
+            renderer.render(scene, camera);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+    </script>
+</body>
+</html>
