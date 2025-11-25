@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Quest 3 MR: Retro Arcade Final</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        /* Pure black background, no overlays to prevent AR dimming artifacts */
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; }
+    </style>
+    <!-- Import Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        // ============================================================================
+        // CONFIGURATION
+        // ============================================================================
+        const CONFIG = {
+            scrollSpeed: 1.4,       // 30% slower
+            
+            // View Boundaries (Closer to player as requested)
+            spawnX: 4.2,            
+            despawnX: -4.2,         
+            viewZ: -2.0,            
+            
+            // Generation
+            segmentLength: 0.3,     
+            radSegments: 12,        
+            
+            // Dimensions
+            radiusMin: 0.20,
+            radiusMax: 0.55,
+            
+            // Positions (Base)
+            topY: 0.5,
+            bottomY: -0.5
+        };
+
+        // ============================================================================
+        // MATERIALS
+        // ============================================================================
+
+        // Custom Cel Shader
+        // Logic: UV.y corresponds to the angle 0..PI.
+        // 0.5 is the "Back" of the curve (PI/2).
+        // 0.0 and 1.0 are the tips of the C-shape.
+        const tunnelMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                colorDeep: { value: new THREE.Color(0x0066ff) }, // Blue (Inside/Back)
+                colorRim:  { value: new THREE.Color(0x444444) }  // Grey (Tips/Front)
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 colorDeep;
+                uniform vec3 colorRim;
+                varying vec2 vUv;
+
+                void main() {
+                    // vUv.y is mapped to the angle of the curve (0 to 1).
+                    // 0.5 = The deepest point (PI/2).
+                    // Distance from center:
+                    float dist = abs(vUv.y - 0.5) * 2.0; // 0 (Center) to 1 (Edges)
+                    
+                    // Retro Cel Shading Steps
+                    float bands = 4.0;
+                    float stepped = floor(dist * bands) / bands;
+
+                    // Mix Colors
+                    vec3 color = mix(colorDeep, colorRim, stepped);
+                    
+                    // Add a subtle rim flash for dimensionality
+                    float alpha = 0.85;
+
+                    gl_FragColor = vec4(color, alpha);
+                }
+            `,
+            side: THREE.BackSide, // Render inside only
+            transparent: true,
+            depthWrite: true
+        });
+
+        const wireMaterial = new THREE.LineBasicMaterial({
+            color: 0xcccccc,
+            linewidth: 1,
+            transparent: true,
+            opacity: 0.4
+        });
+
+        // ============================================================================
+        // UTILS
+        // ============================================================================
+
+        // Pseudo-random noise for organic movement
+        function noise(x, offset) {
+            return Math.sin(x * 0.7 + offset) + Math.sin(x * 1.7 + offset * 2.0) * 0.5;
+        }
+
+        /**
+         * Generates vertices for a specific ring.
+         * KEY FIX: Map UVs based on ANGLE relative to PI, not index relative to count.
+         * This ensures the gradient (Blue-Grey) stays consistent even when geometry morphs.
+         */
+        function getRingData(cx, cy, cz, radius, startAngle, endAngle) {
+            const positions = [];
+            const uvs = [];
+            
+            // We use fixed segment count to keep wireframe density consistent
+            for(let i=0; i <= CONFIG.radSegments; i++) {
+                const t = i / CONFIG.radSegments;
+                const theta = startAngle + t * (endAngle - startAngle);
+
+                // Geometry: Bowing into -Z
+                const vy = cy + (radius * Math.cos(theta));
+                const vz = cz + (radius * -Math.sin(theta)); 
+                
+                positions.push(cx, vy, vz);
+
+                // UV Mapping (Crucial for Cel Shading Fix)
+                // Map the physical angle (theta) to UV space (0..1)
+                // theta ranges from 0 (Top) to PI (Bottom).
+                const v = theta / Math.PI;
+                uvs.push(0, v); // u will be set later in segment construction
+            }
+            return { positions, uvs };
+        }
+
+        // ============================================================================
+        // CLASSES
+        // ============================================================================
+
+        class TunnelSegment {
+            constructor(startData, endData) {
+                this.root = new THREE.Group();
+
+                const posArray = [];
+                const uvArray = [];
+                const indices = [];
+
+                const segs = CONFIG.radSegments;
+                const numPoints = segs + 1;
+
+                // 1. Build Arrays
+                // Start Ring
+                for(let i=0; i<startData.positions.length; i+=3) {
+                    posArray.push(startData.positions[i], startData.positions[i+1], startData.positions[i+2]);
+                    // We overwrite U coordinate here
+                    uvArray.push(0, startData.uvs[(i/3)*2 + 1]); 
+                }
+                // End Ring
+                for(let i=0; i<endData.positions.length; i+=3) {
+                    posArray.push(endData.positions[i], endData.positions[i+1], endData.positions[i+2]);
+                    uvArray.push(1, endData.uvs[(i/3)*2 + 1]); 
+                }
+
+                // 2. Build Triangles
+                for(let i=0; i < segs; i++) {
+                    const a = i;
+                    const b = i + 1;
+                    const c = i + numPoints;
+                    const d = i + numPoints + 1;
+
+                    // Backface culling is irrelevant with BackSide material, but winding matters
+                    indices.push(a, b, d);
+                    indices.push(a, d, c);
+                }
+
+                // 3. Create Geometry
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(posArray, 3));
+                geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvArray, 2));
+                geometry.setIndex(indices);
+                geometry.computeVertexNormals();
+
+                // 4. Mesh
+                this.mesh = new THREE.Mesh(geometry, tunnelMaterial);
+                const wireGeo = new THREE.WireframeGeometry(geometry);
+                this.wire = new THREE.LineSegments(wireGeo, wireMaterial);
+
+                this.root.add(this.mesh);
+                this.root.add(this.wire);
+            }
+
+            translateX(dist) {
+                this.root.position.x += dist;
+            }
+
+            dispose() {
+                this.mesh.geometry.dispose();
+                this.wire.geometry.dispose();
+                this.root.removeFromParent();
+            }
+        }
+
+        class Director {
+            constructor() {
+                this.elapsed = 0;
+                this.mergeState = 0; 
+                this.mergeFactor = 0;
+                this.nextSwitch = 5.0;
+                
+                // Random offsets to break symmetry
+                this.offTop = Math.random() * 100;
+                this.offBot = Math.random() * 100;
+            }
+
+            update(dt) {
+                this.elapsed += dt;
+                
+                // Toggle Logic
+                if(this.elapsed > this.nextSwitch) {
+                    this.mergeState = 1 - this.mergeState;
+                    this.nextSwitch = this.elapsed + (Math.random() * 5 + 3);
+                }
+
+                // Smooth Interpolation
+                const rate = dt * 0.6;
+                if(this.mergeFactor < this.mergeState) 
+                    this.mergeFactor = Math.min(this.mergeFactor + rate, 1.0);
+                else 
+                    this.mergeFactor = Math.max(this.mergeFactor - rate, 0.0);
+            }
+
+            getParams(isTop, x) {
+                const t = this.mergeFactor; // 0 (Split) to 1 (Merged)
+                
+                // Calculate chaotic independent positions
+                const noiseVal = noise(x, isTop ? this.offTop : this.offBot); // Range approx -1.5 to 1.5
+                
+                // Radii (vary independently when split)
+                let rSplit = THREE.MathUtils.mapLinear(noiseVal, -1.5, 1.5, CONFIG.radiusMin, CONFIG.radiusMin * 1.5);
+                const rMerged = CONFIG.radiusMax;
+                
+                // Y Position (wander independently when split)
+                let yBase = isTop ? CONFIG.topY : CONFIG.bottomY;
+                let ySplit = yBase + (noiseVal * 0.15); // Wander up/down
+                
+                // --- MORPH LOGIC ---
+                let y, r, startAng, endAng;
+
+                if (isTop) {
+                    // Top moves to Center (0)
+                    y = THREE.MathUtils.lerp(ySplit, 0, t);
+                    r = THREE.MathUtils.lerp(rSplit, rMerged, t);
+                    
+                    // Angle: Full C (0..PI) -> Top Half (0..PI/2)
+                    startAng = 0;
+                    endAng = THREE.MathUtils.lerp(Math.PI, Math.PI/2, t);
+                } else {
+                    // Bottom moves to Center (0)
+                    y = THREE.MathUtils.lerp(ySplit, 0, t);
+                    r = THREE.MathUtils.lerp(rSplit, rMerged, t);
+                    
+                    // Angle: Full C (0..PI) -> Bottom Half (PI/2..PI)
+                    startAng = THREE.MathUtils.lerp(0, Math.PI/2, t);
+                    endAng = Math.PI;
+                }
+
+                return { y, r, startAng, endAng };
+            }
+        }
+
+        class TunnelStream {
+            constructor(scene, director, isTop) {
+                this.scene = scene;
+                this.director = director;
+                this.isTop = isTop;
+                this.segments = [];
+                
+                this.tailX = CONFIG.despawnX;
+                
+                // Generate Initial Ring
+                const p = this.director.getParams(this.isTop, this.tailX);
+                this.tailData = getRingData(this.tailX, p.y, CONFIG.viewZ, p.r, p.startAng, p.endAng);
+
+                // Pre-fill
+                while(this.tailX < CONFIG.spawnX) {
+                    this.spawnSegment();
+                }
+            }
+
+            spawnSegment() {
+                const endX = this.tailX + CONFIG.segmentLength;
+                const p = this.director.getParams(this.isTop, endX);
+                
+                const endData = getRingData(endX, p.y, CONFIG.viewZ, p.r, p.startAng, p.endAng);
+
+                const segment = new TunnelSegment(this.tailData, endData);
+                this.scene.add(segment.root);
+                this.segments.push(segment);
+
+                this.tailX = endX;
+                this.tailData = endData;
+            }
+
+            update(dt) {
+                const shift = CONFIG.scrollSpeed * dt;
+
+                // Move
+                for(let i = this.segments.length-1; i >= 0; i--) {
+                    const seg = this.segments[i];
+                    seg.translateX(-shift);
+                }
+
+                // Shift Generator
+                this.tailX -= shift;
+                // Shift Cached Vertex Data (positions are index 0, 3, 6...)
+                for(let i=0; i<this.tailData.positions.length; i+=3) {
+                    this.tailData.positions[i] -= shift;
+                }
+
+                // Spawn
+                while(this.tailX < CONFIG.spawnX) {
+                    this.spawnSegment();
+                }
+
+                // Prune
+                // Distance = spawn - despawn (~8.4). SegLength = 0.3. Approx 28 segs.
+                // Keep buffer.
+                if(this.segments.length > 40) {
+                    const old = this.segments.shift();
+                    old.dispose();
+                }
+            }
+        }
+
+        // ============================================================================
+        // APP
+        // ============================================================================
+        let camera, scene, renderer;
+        let director, streamTop, streamBot;
+        let clock;
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 20);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Lighting (Helpers for wireframe)
+            const light = new THREE.DirectionalLight(0xffffff, 1.0);
+            light.position.set(0, 2, 0);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0x444444));
+
+            clock = new THREE.Clock();
+            director = new Director();
+
+            streamTop = new TunnelStream(scene, director, true);
+            streamBot = new TunnelStream(scene, director, false);
+
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+            window.addEventListener('resize', onResize);
+        }
+
+        function onResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function render() {
+            const dt = clock.getDelta();
+
+            director.update(dt);
+            streamTop.update(dt);
+            streamBot.update(dt);
+
+            renderer.render(scene, camera);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+    </script>
+</body>
+</html>
