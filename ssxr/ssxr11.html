@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Quest 3 MR: Ship & Lumpy Tunnels</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; }
+    </style>
+    <!-- Import Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        // ============================================================================
+        // CONFIGURATION
+        // ============================================================================
+        const CONFIG = {
+            scrollSpeed: 1.4,
+            
+            // View Settings
+            spawnX: 4.5,            
+            despawnX: -4.5,         
+            viewZ: -2.5,            
+            
+            // Geometry
+            segmentLength: 0.15,     
+            radSegments: 16,        
+            
+            // Tube Dimensions
+            radiusMin: 0.15, // Thin parts
+            radiusMax: 0.35, // Base thick parts
+            
+            // Positions
+            topY: 0.5,
+            bottomY: -0.5,
+
+            // Ship
+            shipSpeed: 2.0,
+            shipRadius: 0.08,
+            shipXDefault: -1.0 // "Left of center"
+        };
+
+        // ============================================================================
+        // MATERIALS
+        // ============================================================================
+
+        const celMat = new THREE.ShaderMaterial({
+            uniforms: {
+                colorDeep: { value: new THREE.Color(0x0055ff) }, 
+                colorRim:  { value: new THREE.Color(0x444444) }
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 colorDeep;
+                uniform vec3 colorRim;
+                varying vec2 vUv;
+                void main() {
+                    float dist = abs(vUv.y - 0.5) * 2.0; 
+                    float bands = 4.0;
+                    float stepped = floor(dist * bands) / bands;
+                    vec3 col = mix(colorDeep, colorRim, stepped);
+                    gl_FragColor = vec4(col, 0.95);
+                }
+            `,
+            side: THREE.DoubleSide, 
+            transparent: true,
+            depthWrite: true
+        });
+
+        const wireMat = new THREE.LineBasicMaterial({
+            color: 0xffffff,
+            linewidth: 1,
+            transparent: true,
+            opacity: 0.3
+        });
+
+        const shipMat = new THREE.MeshStandardMaterial({
+            color: 0xff4400, // Bright Orange
+            roughness: 0.2,
+            metalness: 0.8,
+            emissive: 0x441100
+        });
+
+        // ============================================================================
+        // GEOMETRY GENERATION
+        // ============================================================================
+
+        function getRing(cx, cy, cz, r, startAng, endAng) {
+            const pos = [];
+            const uv = [];
+            
+            for(let i=0; i <= CONFIG.radSegments; i++) {
+                const ratio = i / CONFIG.radSegments;
+                const theta = startAng + ratio * (endAng - startAng);
+
+                const vy = cy + (r * Math.cos(theta));
+                const vz = cz + (r * -Math.sin(theta));
+                
+                pos.push(cx, vy, vz);
+                const v = theta / Math.PI; 
+                uv.push(0, v);
+            }
+            return { pos, uv };
+        }
+
+        // ============================================================================
+        // SCENE CLASSES
+        // ============================================================================
+
+        class TunnelSegment {
+            constructor(start, end) {
+                this.root = new THREE.Group();
+                const posAttr = []; const uvAttr = []; const indices = [];
+                const segs = CONFIG.radSegments; const row = segs + 1;
+
+                // Build Geometry
+                for(let i=0; i<start.pos.length; i+=3) {
+                    posAttr.push(start.pos[i], start.pos[i+1], start.pos[i+2]);
+                    uvAttr.push(0, start.uv[(i/3)*2+1]);
+                }
+                for(let i=0; i<end.pos.length; i+=3) {
+                    posAttr.push(end.pos[i], end.pos[i+1], end.pos[i+2]);
+                    uvAttr.push(1, end.uv[(i/3)*2+1]);
+                }
+
+                for(let i=0; i<segs; i++) {
+                    const a = i; const b = i + 1; const c = i + row; const d = i + row + 1;
+                    indices.push(a, b, d); indices.push(a, d, c);
+                }
+
+                const geom = new THREE.BufferGeometry();
+                geom.setAttribute('position', new THREE.Float32BufferAttribute(posAttr, 3));
+                geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvAttr, 2));
+                geom.setIndex(indices);
+                geom.computeVertexNormals();
+
+                this.mesh = new THREE.Mesh(geom, celMat);
+                const wireGeo = new THREE.WireframeGeometry(geom);
+                this.wire = new THREE.LineSegments(wireGeo, wireMat);
+
+                this.root.add(this.mesh);
+                this.root.add(this.wire);
+            }
+            translateX(d) { this.root.position.x += d; }
+            dispose() {
+                this.mesh.geometry.dispose(); this.wire.geometry.dispose();
+                this.root.removeFromParent();
+            }
+        }
+
+        class Director {
+            constructor() {
+                this.time = 0;
+                this.mergeState = 0;
+                this.mergeFactor = 0;
+                this.nextEvent = 5.0;
+            }
+
+            update(dt) {
+                this.time += dt;
+                if(this.time > this.nextEvent) {
+                    this.mergeState = 1 - this.mergeState;
+                    this.nextEvent = this.time + 4.0 + (Math.random()*4.0);
+                }
+                const rate = dt * 0.8;
+                if(this.mergeFactor < this.mergeState) this.mergeFactor = Math.min(this.mergeFactor + rate, 1.0);
+                else this.mergeFactor = Math.max(this.mergeFactor - rate, 0.0);
+            }
+
+            getParams(isTop, x) {
+                const t = this.mergeFactor;
+
+                // --- 1. Split Configuration ---
+                // Fast lumpy noise
+                const lumpNoise = Math.sin(x * 6.0 + this.time * 3.0);
+                const rSplit = THREE.MathUtils.mapLinear(lumpNoise, -1, 1, CONFIG.radiusMin, CONFIG.radiusMax);
+                
+                // Y Wave
+                const waveY = Math.sin(x * 1.5 + this.time) * 0.1;
+                const yBase = isTop ? CONFIG.topY : CONFIG.bottomY;
+                const ySplit = yBase + waveY;
+
+                // --- 2. Merged Configuration (NEW REQUIREMENT) ---
+                // "Width varies quickly and randomly... max double the min"
+                // We use a different noise frequency so it feels distinct
+                const mergeLump = Math.sin(x * 5.0 + this.time * 4.0); // Fast oscillation
+                // Min = radiusMax, Max = radiusMax * 2.0
+                const rMergedBase = CONFIG.radiusMax;
+                const rMerged = THREE.MathUtils.mapLinear(mergeLump, -1, 1, rMergedBase, rMergedBase * 2.0);
+                
+                const yMerged = 0; // Center
+
+                // --- 3. Interpolation ---
+                let y, r, start, end;
+
+                if (isTop) {
+                    y = THREE.MathUtils.lerp(ySplit, yMerged, t);
+                    r = THREE.MathUtils.lerp(rSplit, rMerged, t);
+                    start = 0;
+                    end = THREE.MathUtils.lerp(Math.PI, Math.PI/2, t);
+                } else {
+                    y = THREE.MathUtils.lerp(ySplit, yMerged, t);
+                    r = THREE.MathUtils.lerp(rSplit, rMerged, t);
+                    start = THREE.MathUtils.lerp(0, Math.PI/2, t);
+                    end = Math.PI;
+                }
+                return { y, r, start, end };
+            }
+        }
+
+        class Stream {
+            constructor(scene, director, isTop) {
+                this.scene = scene; this.director = director; this.isTop = isTop;
+                this.segs = []; this.cursor = CONFIG.despawnX;
+                const p = director.getParams(isTop, this.cursor);
+                this.tailDat = getRing(this.cursor, p.y, CONFIG.viewZ, p.r, p.start, p.end);
+                while(this.cursor < CONFIG.spawnX) this.spawn();
+            }
+            spawn() {
+                const nextX = this.cursor + CONFIG.segmentLength;
+                const p = this.director.getParams(this.isTop, nextX);
+                const nextDat = getRing(nextX, p.y, CONFIG.viewZ, p.r, p.start, p.end);
+                const s = new TunnelSegment(this.tailDat, nextDat);
+                this.scene.add(s.root);
+                this.segs.push(s);
+                this.cursor = nextX; this.tailDat = nextDat;
+            }
+            update(dt) {
+                const dx = CONFIG.scrollSpeed * dt;
+                for(let s of this.segs) s.translateX(-dx);
+                this.cursor -= dx;
+                for(let i=0; i<this.tailDat.pos.length; i+=3) this.tailDat.pos[i] -= dx;
+                while(this.cursor < CONFIG.spawnX) this.spawn();
+                const max = Math.ceil((CONFIG.spawnX - CONFIG.despawnX)/CONFIG.segmentLength) + 5;
+                if(this.segs.length > max) this.segs.shift().dispose();
+            }
+        }
+
+        // ============================================================================
+        // SHIP CLASS
+        // ============================================================================
+
+        class Ship {
+            constructor(scene) {
+                // Flattened Sphere
+                const geom = new THREE.SphereGeometry(CONFIG.shipRadius, 16, 16);
+                geom.scale(1.2, 0.4, 0.8); // Flattened
+                this.mesh = new THREE.Mesh(geom, shipMat);
+                
+                // Position "Left of center"
+                this.pos = new THREE.Vector3(CONFIG.shipXDefault, 0, CONFIG.viewZ);
+                this.mesh.position.copy(this.pos);
+                scene.add(this.mesh);
+            }
+
+            update(dt, director, renderer) {
+                // 1. INPUT HANDLING (Left Thumbstick)
+                const session = renderer.xr.getSession();
+                let inputX = 0;
+                let inputY = 0;
+
+                if (session) {
+                    for (const source of session.inputSources) {
+                        if (source.handedness === 'left' && source.gamepad) {
+                            const axes = source.gamepad.axes;
+                            // Usually axes[2] is X, axes[3] is Y on Quest
+                            if (axes.length >= 4) {
+                                inputX = axes[2]; 
+                                inputY = -axes[3]; // Invert Y
+                            }
+                        }
+                    }
+                }
+
+                // Apply Movement
+                const speed = CONFIG.shipSpeed * dt;
+                this.pos.x += inputX * speed;
+                this.pos.y += inputY * speed;
+
+                // 2. CONSTRAINTS (Keep inside tunnel)
+                // Get current tunnel stats at ship's X position
+                // Note: We need to ask the director for params at the ship's current X.
+                // We check top tube first.
+                const pTop = director.getParams(true, this.pos.x);
+                const pBot = director.getParams(false, this.pos.x);
+
+                // Determine effective tunnel center and radius for collision
+                let targetY = 0;
+                let targetR = 0;
+
+                // Heuristic: Are we merged?
+                if (director.mergeFactor > 0.5) {
+                    // Merged: Use combined center (0) and Merged Radius (same for top/bot params)
+                    targetY = pTop.y; // Should be near 0
+                    targetR = pTop.r;
+                } else {
+                    // Split: Determine which tube we are closer to
+                    const distTop = Math.abs(this.pos.y - pTop.y);
+                    const distBot = Math.abs(this.pos.y - pBot.y);
+                    if (distTop < distBot) {
+                        targetY = pTop.y;
+                        targetR = pTop.r;
+                    } else {
+                        targetY = pBot.y;
+                        targetR = pBot.r;
+                    }
+                }
+
+                // Collision Math (YZ Plane)
+                // We want to keep ship inside circle defined by (targetY, viewZ) with radius targetR
+                const dy = this.pos.y - targetY;
+                const dz = 0; // We lock Z to viewZ, so delta is 0
+                const distFromCenter = Math.abs(dy); // Simple vertical distance + radius check
+
+                // Allow a small buffer (ship radius)
+                const maxDist = targetR - CONFIG.shipRadius;
+
+                if (maxDist > 0) { // Only clamp if tunnel is wide enough
+                    if (distFromCenter > maxDist) {
+                        // Push back
+                        // Direction is sign of dy
+                        const sign = Math.sign(dy);
+                        this.pos.y = targetY + (sign * maxDist);
+                    }
+                }
+
+                // Hard clamp X to screen bounds
+                this.pos.x = Math.max(CONFIG.despawnX + 1, Math.min(CONFIG.spawnX - 1, this.pos.x));
+                
+                // Update Mesh
+                this.mesh.position.set(this.pos.x, this.pos.y, CONFIG.viewZ);
+                
+                // Tilt ship based on input
+                this.mesh.rotation.z = -inputY * 0.5;
+                this.mesh.rotation.x = inputX * 0.5;
+            }
+        }
+
+        // ============================================================================
+        // APP SETUP
+        // ============================================================================
+        let camera, scene, renderer;
+        let director, s1, s2, ship;
+        let clock;
+
+        init();
+
+        function init() {
+            scene = new THREE.Scene();
+            
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 20);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            renderer.xr.setFoveation(0); 
+            renderer.setClearColor(0x000000, 0);
+
+            document.body.appendChild(renderer.domElement);
+
+            const amb = new THREE.AmbientLight(0xffffff, 1);
+            scene.add(amb);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+            dirLight.position.set(0, 2, 2);
+            scene.add(dirLight);
+
+            clock = new THREE.Clock();
+            director = new Director();
+
+            s1 = new Stream(scene, director, true);
+            s2 = new Stream(scene, director, false);
+            ship = new Ship(scene);
+
+            document.body.appendChild(ARButton.createButton(renderer, { 
+                requiredFeatures: ['local'] 
+            }));
+            
+            renderer.setAnimationLoop(render);
+        }
+
+        function render() {
+            const dt = clock.getDelta();
+            
+            director.update(dt);
+            s1.update(dt);
+            s2.update(dt);
+            ship.update(dt, director, renderer);
+            
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
