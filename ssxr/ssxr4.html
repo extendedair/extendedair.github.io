@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Quest 3 MR: Seamless Retro Tunnel</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; }
+        #info {
+            position: absolute; top: 20px; left: 0; width: 100%;
+            text-align: center; color: #00ff00; pointer-events: none; z-index: 99;
+            text-shadow: 2px 2px 0px #000; font-weight: bold; font-size: 1.2em;
+        }
+    </style>
+    <!-- Import Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="info">
+        RETRO MR ENGINE v3<br/>
+        SEAMLESS JOINING ACTIVATED
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        // ============================================================================
+        // CONFIGURATION
+        // ============================================================================
+        const CONFIG = {
+            scrollSpeed: 3.0,       // Meters per second (Right to Left)
+            spawnX: 10.0,           // Spawn distance (Right)
+            despawnX: -10.0,        // Despawn distance (Left)
+            segmentWidth: 0.5,      // Distance between rings (smaller = smoother curve)
+            viewZ: -3.0,            // Base Z depth of the tunnels
+            
+            // Tube Settings
+            radialSegments: 16,     // How many lines around the curve
+            arcStart: Math.PI / 2,  // 90 degrees (Top)
+            arcEnd: 3 * Math.PI / 2,// 270 degrees (Bottom) -> Creates Back Half
+            
+            // Dynamic Generation
+            radiusMin: 0.3,
+            radiusMax: 0.8,
+            topY: 0.8,
+            bottomY: -0.8
+        };
+
+        // ============================================================================
+        // MATERIALS
+        // ============================================================================
+
+        // 1. Cel Shader (Blue -> Grey)
+        const tunnelMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                colorCenter: { value: new THREE.Color(0x0066ff) }, // Bright Blue
+                colorEdge:   { value: new THREE.Color(0x333333) }  // Dark Grey
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 colorCenter;
+                uniform vec3 colorEdge;
+                varying vec2 vUv;
+
+                void main() {
+                    // vUv.y maps to the arc (0 = Top, 0.5 = Back Center, 1 = Bottom)
+                    // We want the "Back" (0.5) to be Blue, edges Grey.
+                    float dist = abs(vUv.y - 0.5) * 2.0; 
+                    
+                    // Cel Banding
+                    float bands = 4.0;
+                    float stepped = floor(dist * bands) / bands;
+
+                    vec3 color = mix(colorCenter, colorEdge, stepped);
+                    
+                    // Opacity: Fade out slightly at edges
+                    float alpha = 0.8;
+                    
+                    gl_FragColor = vec4(color, alpha);
+                }
+            `,
+            side: THREE.DoubleSide, // Render both sides of the skin
+            transparent: true,
+            depthWrite: true
+        });
+
+        // 2. Wireframe Material
+        const wireMaterial = new THREE.LineBasicMaterial({
+            color: 0xaaaaaa,
+            linewidth: 1,
+            transparent: true,
+            opacity: 0.4
+        });
+
+        // ============================================================================
+        // HELPERS
+        // ============================================================================
+
+        // Generates a "Ring" of data: vertices at a specific X, Y, Z, Radius
+        function generateRingData(x, y, z, radius) {
+            const vertices = [];
+            // We only generate the arc from PI/2 to 3PI/2 (The back half)
+            const startAngle = CONFIG.arcStart;
+            const endAngle = CONFIG.arcEnd;
+            const totalAngle = endAngle - startAngle;
+
+            for (let i = 0; i <= CONFIG.radialSegments; i++) {
+                const ratio = i / CONFIG.radialSegments;
+                const theta = startAngle + (ratio * totalAngle);
+
+                // Circle in YZ plane
+                // Y = cos(theta) * r + yOffset
+                // Z = sin(theta) * r + zOffset
+                // Note: To make the "Back" half (furthest from camera at Z=0),
+                // we use the semi-circle where Z is pushed backwards relative to center.
+                // Standard Sin/Cos:
+                // If 0 is Right (+Z?), 90 is Up (+Y), 180 is Left (-Z), 270 is Down (-Y).
+                // We want mesh at -Z. So angles around 180 (PI).
+                
+                const localY = Math.cos(theta) * radius;
+                const localZ = Math.sin(theta) * radius; // Sin(PI) = 0, Sin(3PI/2)=-1
+
+                // Adjust logic to ensure the "Back" of the C is facing away from camera
+                // We want the opening to face +Z. The mesh is at -Z.
+                // We'll map the curve so it bows away from camera.
+                
+                const vY = y + localY;
+                const vZ = z + localZ; // Base Z is e.g. -3. Vertices will be -3 +/- radius.
+                
+                vertices.push(x, vY, vZ);
+            }
+            return vertices;
+        }
+
+        // ============================================================================
+        // TUNNEL LOGIC
+        // ============================================================================
+
+        /**
+         * Represents a segment connecting two rings (PrevRing -> NextRing).
+         * This ensures perfect joining because we build the mesh spanning the two states.
+         */
+        class SegmentMesh {
+            constructor(prevRingData, nextRingData) {
+                this.geometry = new THREE.BufferGeometry();
+                
+                // 1. Build Vertices
+                // Combine prev ring and next ring vertices
+                const positions = [];
+                const uvs = [];
+
+                // We assume both rings have same number of segments (CONFIG.radialSegments + 1 points)
+                const pointCount = (CONFIG.radialSegments + 1);
+
+                // Add all vertices to the buffer
+                // Order: First all PrevRing points, then all NextRing points
+                positions.push(...prevRingData);
+                positions.push(...nextRingData);
+
+                // 2. Build Indices (Triangles)
+                const indices = [];
+                for (let i = 0; i < CONFIG.radialSegments; i++) {
+                    // Quad formed by:
+                    // A = prev[i], B = prev[i+1]
+                    // C = next[i], D = next[i+1]
+                    const a = i;
+                    const b = i + 1;
+                    const c = i + pointCount;
+                    const d = i + pointCount + 1;
+
+                    // Triangle 1 (A-C-B) - check winding order for visibility
+                    indices.push(a, c, b);
+                    // Triangle 2 (B-C-D)
+                    indices.push(b, c, d);
+                }
+
+                // 3. Build UVs
+                for (let r = 0; r < 2; r++) { // 0 = prev ring, 1 = next ring
+                    for (let i = 0; i <= CONFIG.radialSegments; i++) {
+                        const u = r; // 0 at start, 1 at end (Gradient along length)
+                        const v = i / CONFIG.radialSegments; // 0 to 1 along curve
+                        uvs.push(u, v);
+                    }
+                }
+
+                this.geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                this.geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+                this.geometry.setIndex(indices);
+                this.geometry.computeVertexNormals();
+
+                // 4. Create Meshes
+                this.mesh = new THREE.Mesh(this.geometry, tunnelMaterial);
+                
+                // Wireframe: Use WireframeGeometry on this specific chunk to get the grid look
+                // Or just LineSegments on the edges. WireframeGeometry is easiest for "Grid" look.
+                const wireGeo = new THREE.WireframeGeometry(this.geometry);
+                this.wire = new THREE.LineSegments(wireGeo, wireMaterial);
+
+                this.group = new THREE.Group();
+                this.group.add(this.mesh);
+                this.group.add(this.wire);
+            }
+
+            dispose() {
+                this.geometry.dispose();
+                this.mesh.material.dispose(); // Shared, but safe if standard cleanup
+                this.wire.geometry.dispose();
+                this.group.removeFromParent();
+            }
+        }
+
+        /**
+         * Director controls the procedural shape and merging logic.
+         */
+        class TunnelDirector {
+            constructor() {
+                this.time = 0;
+                this.isMerged = false;
+                this.mergeFactor = 0; // 0 = split, 1 = merged
+                this.nextToggle = 5.0;
+            }
+
+            update(delta) {
+                this.time += delta;
+                
+                // Toggle merge state logic
+                if (this.time > this.nextToggle) {
+                    this.isMerged = !this.isMerged;
+                    this.nextToggle = this.time + (Math.random() * 5 + 3);
+                    console.log("State Change: " + (this.isMerged ? "MERGE" : "SPLIT"));
+                }
+
+                // Smooth transition
+                const target = this.isMerged ? 1.0 : 0.0;
+                const rate = delta * 0.5; // Slow blend
+                if (this.mergeFactor < target) this.mergeFactor = Math.min(this.mergeFactor + rate, 1.0);
+                else if (this.mergeFactor > target) this.mergeFactor = Math.max(this.mergeFactor - rate, 0.0);
+            }
+
+            getPoint(isTop, x) {
+                // Calculate target Y
+                const splitY = isTop ? CONFIG.topY : CONFIG.bottomY;
+                const mergedY = 0;
+                
+                let y = THREE.MathUtils.lerp(splitY, mergedY, this.mergeFactor);
+                
+                // Add noise/waviness
+                y += Math.sin(x * 0.5 + this.time) * 0.2; // Vertical wave
+                
+                // Calculate Z (Depth wave)
+                // We keep it mostly at viewZ, but wobble a bit
+                const z = CONFIG.viewZ + Math.cos(x * 0.8 + this.time * 0.5) * 0.3;
+
+                // Calculate Radius
+                const noise = Math.sin(x * 2.0 + this.time);
+                let r = THREE.MathUtils.mapLinear(noise, -1, 1, CONFIG.radiusMin, CONFIG.radiusMax);
+                
+                // Be larger when merged
+                if(this.mergeFactor > 0.5) r *= 1.2;
+
+                return { x, y, z, r };
+            }
+        }
+
+        /**
+         * Manages a single stream of connected segments.
+         */
+        class TunnelStream {
+            constructor(scene, director, isTop) {
+                this.scene = scene;
+                this.director = director;
+                this.isTop = isTop;
+                this.segments = []; // The visual meshes
+                
+                // "Last Ring" state to ensure perfect connection to new segments
+                this.tailX = CONFIG.despawnX;
+                this.lastRingData = null;
+
+                // Initialize: Fill screen from left to right
+                this.initStream();
+            }
+
+            initStream() {
+                // Generate first ring at far left
+                const startPt = this.director.getPoint(this.isTop, this.tailX);
+                this.lastRingData = generateRingData(startPt.x, startPt.y, startPt.z, startPt.r);
+
+                // Loop until we reach spawn point
+                while (this.tailX < CONFIG.spawnX) {
+                    this.spawnSegment();
+                }
+            }
+
+            spawnSegment() {
+                // Determine next position
+                const nextX = this.tailX + CONFIG.segmentWidth;
+                const pt = this.director.getPoint(this.isTop, nextX);
+                
+                // Generate vertices for the NEW end ring
+                const nextRingData = generateRingData(pt.x, pt.y, pt.z, pt.r);
+
+                // Create mesh connecting Last -> Next
+                const seg = new SegmentMesh(this.lastRingData, nextRingData);
+                this.scene.add(seg.group);
+                this.segments.push(seg);
+
+                // Update state
+                this.tailX = nextX;
+                this.lastRingData = nextRingData;
+            }
+
+            update(shiftAmount) {
+                // Move all segments left
+                // Since geometry is baked in world space (offset by group position),
+                // we can just move the groups.
+                for (let i = this.segments.length - 1; i >= 0; i--) {
+                    const seg = this.segments[i];
+                    seg.group.position.x -= shiftAmount;
+
+                    // Despawn check
+                    if (seg.group.position.x < (CONFIG.despawnX - 5)) { // Buffer
+                        seg.dispose();
+                        this.segments.splice(i, 1);
+                    }
+                }
+
+                // Move our generative cursor (conceptually) back by shiftAmount
+                // because the world moved.
+                this.tailX -= shiftAmount;
+
+                // If tail is on screen, spawn new segments
+                while(this.tailX < CONFIG.spawnX) {
+                    this.spawnSegment();
+                }
+            }
+        }
+
+        // ============================================================================
+        // MAIN APP
+        // ============================================================================
+        let camera, scene, renderer;
+        let director;
+        let streamTop, streamBot;
+        let clock;
+
+        init();
+        animate();
+
+        function init() {
+            // Scene
+            scene = new THREE.Scene();
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+            
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Lighting (for wireframe definition if needed)
+            const light = new THREE.DirectionalLight(0xffffff, 1);
+            light.position.set(0, 1, 1);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0x404040));
+
+            // Logic
+            clock = new THREE.Clock();
+            director = new TunnelDirector();
+
+            // Create two streams
+            streamTop = new TunnelStream(scene, director, true);
+            streamBot = new TunnelStream(scene, director, false);
+
+            // XR Button
+            document.body.appendChild(ARButton.createButton(renderer, { 
+                requiredFeatures: ['local'] 
+            }));
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+        }
+
+        function render() {
+            const delta = clock.getDelta();
+            const shift = CONFIG.scrollSpeed * delta;
+
+            director.update(delta);
+            streamTop.update(shift);
+            streamBot.update(shift);
+
+            renderer.render(scene, camera);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+    </script>
+</body>
+</html>
