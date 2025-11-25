@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Quest 3 MR: Perfect Tunnel</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; font-family: monospace; }
+        #debug {
+            position: absolute; top: 20px; left: 0; width: 100%;
+            text-align: center; color: #00ffff; pointer-events: none; z-index: 999;
+            text-shadow: 1px 1px 0 #000; font-weight: bold; font-size: 1.2rem;
+        }
+    </style>
+    <!-- Import Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="debug">
+        SYSTEM: LOCKED <br/> 
+        VIEW: INSIDE CURVE
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        // ============================================================================
+        // CONFIG
+        // ============================================================================
+        const CONFIG = {
+            scrollSpeed: 2.0,       // Meters/sec moving Left
+            segmentLength: 0.4,     // Distance between rings (granularity)
+            
+            spawnX: 6.0,            // Right side of screen
+            despawnX: -6.0,         // Left side of screen
+            viewZ: -2.0,            // Depth of tunnel center
+            
+            // Tube Dimensions
+            radSegments: 16,        // Smoothness of curve
+            radiusMin: 0.25,
+            radiusMax: 0.60,
+            
+            // Positions
+            topY: 0.6,
+            bottomY: -0.6
+        };
+
+        // ============================================================================
+        // MATERIALS
+        // ============================================================================
+        
+        // 1. Cel Shader (Blue-to-Grey Gradient)
+        const tunnelMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                colorCenter: { value: new THREE.Color(0x0088ff) }, // Bright Blue
+                colorEdge:   { value: new THREE.Color(0x222222) }  // Dark Grey
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 colorCenter;
+                uniform vec3 colorEdge;
+                varying vec2 vUv;
+
+                void main() {
+                    // vUv.y follows the arc (0 to 1). 
+                    // 0.5 is the deepest part of the curve (the back).
+                    float dist = abs(vUv.y - 0.5) * 2.0; 
+                    
+                    // Cel Banding Steps
+                    float bands = 5.0;
+                    float stepped = floor(dist * bands) / bands;
+
+                    vec3 color = mix(colorCenter, colorEdge, stepped);
+                    
+                    // Slight transparency for AR feel
+                    gl_FragColor = vec4(color, 0.85); 
+                }
+            `,
+            side: THREE.BackSide, // IMPORTANT: Render the inside of the tube
+            transparent: true,
+            depthWrite: true
+        });
+
+        // 2. Wireframe Material
+        const wireMaterial = new THREE.LineBasicMaterial({
+            color: 0xaaaaaa,
+            linewidth: 1,
+            transparent: true,
+            opacity: 0.3
+        });
+
+        // ============================================================================
+        // GEOMETRY HELPERS
+        // ============================================================================
+
+        /**
+         * Calculates a ring of vertices for the tunnel cross-section.
+         * Creates a "C" shape bowing into -Z (Away from camera).
+         */
+        function getRingVertices(cx, cy, cz, radius) {
+            const vertices = [];
+            // We want a semi-circle from 0 to PI (180 degrees)
+            // 0 = Right, PI/2 = Top? 
+            // Let's use Cos/Sin on Y/Z plane.
+            // Z needs to be negative relative to center to form the "Back" wall.
+            
+            // Angle range: -PI/2 to PI/2 is the right side.
+            // We want Top (+Y) to Bottom (-Y) curving through -Z.
+            
+            const startAng = 0;
+            const endAng = Math.PI;
+
+            for(let i=0; i <= CONFIG.radSegments; i++) {
+                const t = i / CONFIG.radSegments;
+                const theta = startAng + t * (endAng - startAng);
+
+                // Parametric equation for a C-shape facing +Z:
+                // x = fixed (cx)
+                // y = radius * cos(theta) -> goes 1 to -1
+                // z = radius * -sin(theta) -> goes 0 to -1 to 0 (bows back)
+                
+                const vx = cx;
+                const vy = cy + (radius * Math.cos(theta));
+                const vz = cz + (radius * -Math.sin(theta)); 
+                
+                vertices.push(new THREE.Vector3(vx, vy, vz));
+            }
+            return vertices;
+        }
+
+        // ============================================================================
+        // LOGIC CLASSES
+        // ============================================================================
+
+        /**
+         * Manages one chunk of tunnel (Start Ring -> End Ring).
+         */
+        class TunnelSegment {
+            constructor(startVerts, endVerts) {
+                // startVerts and endVerts are Arrays of Vector3
+                
+                this.mesh = null;
+                this.wire = null;
+
+                const positions = [];
+                const indices = [];
+                const uvs = [];
+
+                const segs = CONFIG.radSegments;
+                const numPoints = segs + 1; // Vertices per ring
+
+                // 1. Flatten vertices into position buffer
+                // Order: First Ring (Start), then Second Ring (End)
+                for(let v of startVerts) positions.push(v.x, v.y, v.z);
+                for(let v of endVerts)   positions.push(v.x, v.y, v.z);
+
+                // 2. Generate Triangles (Indices)
+                // Connecting Ring 0 to Ring 1
+                for(let i=0; i < segs; i++) {
+                    const a = i;
+                    const b = i + 1;
+                    const c = i + numPoints;
+                    const d = i + numPoints + 1;
+
+                    // Quad A-B-D-C
+                    // Tri 1
+                    indices.push(a, d, b);
+                    // Tri 2
+                    indices.push(a, c, d);
+                }
+
+                // 3. UVs
+                for(let r=0; r<2; r++) { // 0=start ring, 1=end ring
+                    for(let i=0; i<=segs; i++) {
+                        const u = r; // 0 or 1 along length
+                        const v = i / segs; // 0 to 1 along arc
+                        uvs.push(u, v);
+                    }
+                }
+
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+                geometry.setIndex(indices);
+                geometry.computeVertexNormals();
+
+                // Create Objects
+                this.mesh = new THREE.Mesh(geometry, tunnelMaterial);
+                
+                // Wireframe: Use WireframeGeometry to get the grid
+                const wireGeo = new THREE.WireframeGeometry(geometry);
+                this.wire = new THREE.LineSegments(wireGeo, wireMaterial);
+
+                // No Group wrapper needed, we add directly to scene or parent
+                // But we will use a group to move them easily if we wanted relative motion,
+                // but here vertices are baked in world space (offset X).
+                // Actually, to scroll, we need to move the mesh.
+                
+                this.root = new THREE.Group();
+                this.root.add(this.mesh);
+                this.root.add(this.wire);
+            }
+
+            // Move the segment
+            translateX(dist) {
+                this.root.position.x += dist;
+            }
+
+            dispose() {
+                this.mesh.geometry.dispose();
+                this.wire.geometry.dispose();
+                this.root.removeFromParent();
+            }
+        }
+
+        /**
+         * The Director decides the shape (Y and Radius) at any given X.
+         */
+        class Director {
+            constructor() {
+                this.elapsed = 0;
+                this.mergeState = 0; // 0 = split, 1 = merged
+                this.mergeFactor = 0;
+                this.nextSwitch = 3.0;
+            }
+
+            update(dt) {
+                this.elapsed += dt;
+                
+                // Toggle Merge
+                if(this.elapsed > this.nextSwitch) {
+                    this.mergeState = 1 - this.mergeState; // Toggle 0/1
+                    this.nextSwitch = this.elapsed + (Math.random() * 4 + 2);
+                }
+
+                // Smooth Factor
+                const rate = dt * 0.8;
+                if(this.mergeFactor < this.mergeState) 
+                    this.mergeFactor = Math.min(this.mergeFactor + rate, 1.0);
+                else 
+                    this.mergeFactor = Math.max(this.mergeFactor - rate, 0.0);
+            }
+
+            getParams(isTop, x) {
+                // Calculate Radius
+                const noise = Math.sin(x * 1.5 + this.elapsed); 
+                let r = THREE.MathUtils.mapLinear(noise, -1, 1, CONFIG.radiusMin, CONFIG.radiusMax);
+                
+                // Calculate Y
+                const splitY = isTop ? CONFIG.topY : CONFIG.bottomY;
+                const mergedY = 0;
+                let y = THREE.MathUtils.lerp(splitY, mergedY, this.mergeFactor);
+
+                // Add organic wave
+                y += Math.sin(x * 0.5 + this.elapsed * 0.5) * 0.15;
+
+                // If merged, increase radius slightly to accommodate
+                if(this.mergeFactor > 0.5) r *= 1.3;
+
+                return { y, r };
+            }
+        }
+
+        /**
+         * Stream Manager
+         */
+        class TunnelStream {
+            constructor(scene, director, isTop) {
+                this.scene = scene;
+                this.director = director;
+                this.isTop = isTop;
+                
+                this.segments = [];
+                
+                // The "Cursor" tracks the World X coordinate where the *next* segment begins.
+                // Initially, we fill from despawnX to spawnX.
+                
+                // 1. Generate the very first ring data at the far left
+                let startX = CONFIG.despawnX;
+                const p = this.director.getParams(this.isTop, startX);
+                
+                // Store the Vertices of the "Tail" (End of the stream)
+                // We calculate them once, and then pass them as "Start" to the next segment.
+                // This guarantees connection.
+                this.tailVertices = getRingVertices(startX, p.y, CONFIG.viewZ, p.r);
+                this.tailX = startX;
+
+                // Pre-fill
+                while(this.tailX < CONFIG.spawnX) {
+                    this.spawnSegment();
+                }
+            }
+
+            spawnSegment() {
+                // Determine where the new segment ends
+                const endX = this.tailX + CONFIG.segmentLength;
+                
+                // Ask Director for shape at endX
+                const p = this.director.getParams(this.isTop, endX);
+                
+                // Generate Vertices for the End Ring
+                // Note: The X passed to vertices generation is RELATIVE to the segment?
+                // No, we generate in World Space coordinates for simplicity, 
+                // then we can shift the Group.
+                // Actually, if we generate vertices at `endX` (e.g. 10), and the previous were at `tailX` (9.5)...
+                // The geometry is baked at X=9.5 to X=10.
+                // The mesh Position is (0,0,0).
+                
+                const endVertices = getRingVertices(endX, p.y, CONFIG.viewZ, p.r);
+
+                // Create Segment bridging Tail -> End
+                const segment = new TunnelSegment(this.tailVertices, endVertices);
+                this.scene.add(segment.root);
+                this.segments.push(segment);
+
+                // Update Tail
+                this.tailVertices = endVertices;
+                this.tailX = endX;
+            }
+
+            update(dt) {
+                const shift = CONFIG.scrollSpeed * dt;
+
+                // 1. Move all existing segments left
+                for(let i = this.segments.length-1; i >= 0; i--) {
+                    const seg = this.segments[i];
+                    seg.translateX(-shift);
+
+                    // Check bounds (World X of the segment geometry)
+                    // Since geometry was baked at large X, and we translate,
+                    // we need to check approximate position.
+                    // Easier: check the root position + original X.
+                    // But segments were baked at different X. 
+                    // Wait, if we bake at X=10, and translate -1, it's at 9.
+                    // We can check the `root.position.x` if we know where it started.
+                    // BUT, simpler logic: 
+                    // Use a counter on the segment? Or check world position of first vertex?
+                    
+                    // Let's use `tailX` logic. The `tailX` variable tracks the *generative* cursor (World space before scroll).
+                    // We need to shift the *generative cursor* too?
+                    // No. In an infinite scroller:
+                    // The World moves Left. The Cursor (Spawn Point) is static relative to Camera?
+                    // No, Spawn Point is static X (e.g. +10).
+                    // The "Tail" of the tube moves Left.
+                }
+
+                // 2. Adjust the Tail Tracker
+                // The physical vertices of `tailVertices` have moved left by `shift`.
+                // We must update the stored vertices data so the NEXT segment attaches to the NEW position.
+                this.tailVertices.forEach(v => v.x -= shift);
+                this.tailX -= shift;
+
+                // 3. Spawn new if tail has moved into view (left of spawnX)
+                while(this.tailX < CONFIG.spawnX) {
+                    this.spawnSegment();
+                }
+
+                // 4. Cleanup old segments
+                // If a segment's `root.position.x` + `original_creation_x` < despawn...
+                // Simpler: Just check array size. If we added one, remove one?
+                // Or check the right-most vertex of the oldest segment.
+                // Since we translate root.x:
+                if(this.segments.length > 0) {
+                    const firstSeg = this.segments[0];
+                    // Approximate check: 
+                    // We know segments are roughly `segmentLength`. 
+                    // If we have too many segments, pop the first.
+                    const maxSegments = Math.ceil((CONFIG.spawnX - CONFIG.despawnX) / CONFIG.segmentLength) + 2;
+                    if(this.segments.length > maxSegments) {
+                        firstSeg.dispose();
+                        this.segments.shift();
+                    }
+                }
+            }
+        }
+
+        // ============================================================================
+        // MAIN
+        // ============================================================================
+        let camera, scene, renderer;
+        let director;
+        let topStream, botStream;
+        let clock;
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 20);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Light (helper)
+            const light = new THREE.DirectionalLight(0xffffff, 1);
+            light.position.set(0, 2, 2);
+            scene.add(light);
+            scene.add(new THREE.AmbientLight(0x404040));
+
+            clock = new THREE.Clock();
+            director = new Director();
+
+            topStream = new TunnelStream(scene, director, true);
+            botStream = new TunnelStream(scene, director, false);
+
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+            window.addEventListener('resize', onResize);
+        }
+
+        function onResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render() {
+            const dt = clock.getDelta();
+
+            director.update(dt);
+            topStream.update(dt);
+            botStream.update(dt);
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
