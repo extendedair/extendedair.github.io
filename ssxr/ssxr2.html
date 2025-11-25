@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Quest 3 MR Side Scroller</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; }
+        #overlay {
+            position: absolute; top: 10px; left: 0; width: 100%;
+            text-align: center; color: #00ffff; pointer-events: none; z-index: 1;
+            text-shadow: 2px 2px 0px #000; letter-spacing: 2px;
+            font-weight: bold;
+        }
+    </style>
+    <!-- Import Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="overlay">
+        SYSTEM READY<br/>
+        SIDE SCROLLING: ACTIVE
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        // ============================================================================
+        // CONFIGURATION
+        // ============================================================================
+        const CONFIG = {
+            scrollSpeed: 1.5,       // Meters per second moving Left
+            spawnX: 6.0,            // Spawn off-screen to the right
+            despawnX: -6.0,         // Despawn off-screen to the left
+            segmentWidth: 0.5,      // Width of each slice (smaller = smoother curves)
+            viewZ: -2.0,            // How far away the game plane is (Z-depth)
+            
+            // Tunnel Settings
+            topTunnelY: 0.8,        // Base height for top tunnel
+            bottomTunnelY: -0.8,    // Base height for bottom tunnel
+            baseRadius: 0.4,        // Average thickness
+            noiseScale: 0.8         // How curvy the tunnels are
+        };
+
+        // ============================================================================
+        // ASSETS / MATERIALS
+        // ============================================================================
+
+        /**
+         * Custom Shader for the Blue-to-Grey Cel Shaded look.
+         * Creates a gradient based on the curve of the pipe (UV.x).
+         */
+        const tunnelMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                colorBlue: { value: new THREE.Color(0x0066ff) }, // Bright Blue
+                colorGrey: { value: new THREE.Color(0x222222) }, // Dark Grey
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                varying vec3 vNormal;
+                void main() {
+                    vUv = uv;
+                    vNormal = normal;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 colorBlue;
+                uniform vec3 colorGrey;
+                varying vec2 vUv;
+                varying vec3 vNormal;
+
+                void main() {
+                    // vUv.x runs around the curve of the cylinder (0.0 to 1.0)
+                    // We map this to create a gradient from the edges to the center
+                    // to give a sense of depth inside the tube.
+                    
+                    float gradient = abs(vUv.x - 0.5) * 2.0; // 0 at center, 1 at edges
+                    
+                    // Cel Shading: Step the gradient into bands
+                    float bands = 4.0;
+                    float stepped = floor(gradient * bands) / bands;
+
+                    // Mix colors: Center is Blue, Edges fade to Grey/Dark
+                    vec3 finalColor = mix(colorBlue, colorGrey, stepped);
+
+                    // Add a simple rim highlight for 'glassy' feel
+                    float fresnel = 1.0 - dot(vNormal, vec3(0,0,1));
+                    if(fresnel > 0.8) finalColor += vec3(0.2);
+
+                    gl_FragColor = vec4(finalColor, 0.9);
+                }
+            `,
+            transparent: true,
+            side: THREE.DoubleSide, // See both inside and outside
+            depthWrite: true
+        });
+
+        const wireframeMaterial = new THREE.LineBasicMaterial({ 
+            color: 0xcccccc, // Pale Grey
+            linewidth: 1,
+            transparent: true,
+            opacity: 0.5
+        });
+
+        // ============================================================================
+        // LOGIC
+        // ============================================================================
+
+        /**
+         * Represents one slice of the tunnel.
+         */
+        class TunnelSegment {
+            constructor(positionA, radiusA, positionB, radiusB) {
+                this.group = new THREE.Group();
+
+                // 1. Calculate orientation
+                // We are connecting Point A to Point B.
+                const vector = new THREE.Vector3().subVectors(positionB, positionA);
+                const length = vector.length();
+                
+                // 2. Geometry
+                // Cylinder: TopRad, BotRad, Height, RadialSegs, HeightSegs, OpenEnded, ThetaStart, ThetaLength
+                // ThetaLength = PI (Half pipe). 
+                // We rotate ThetaStart so the opening faces +Z (Camera).
+                const geometry = new THREE.CylinderGeometry(
+                    radiusB, radiusA, length, 
+                    12, 1, true, 
+                    0, Math.PI
+                );
+
+                // 3. Mesh
+                this.mesh = new THREE.Mesh(geometry, tunnelMaterial);
+                
+                // 4. Wireframe
+                // We want grid lines. WireframeGeometry creates lines for every triangle edge.
+                // To get the "Grid" look from the drawing, we use EdgesGeometry + custom ring.
+                // But specifically for Cylinder, WireframeGeometry looks good if segments are low.
+                const wireGeo = new THREE.WireframeGeometry(geometry);
+                this.wire = new THREE.LineSegments(wireGeo, wireframeMaterial);
+                
+                // 5. Orientation Magic
+                // Cylinder defaults to Vertical (Y-axis).
+                // We need to rotate it to align with the vector A->B.
+                // Also, we need to ensure the "Cutaway" (Open side) faces the camera (+Z).
+                
+                // Standard lookAt aligns +Z to the target. 
+                // This is tricky with Cylinders and Cutaways combined.
+                // Approach: Create a pivot.
+                
+                // Initial rotation to make the half-pipe face +Z
+                // Default cylinder: Axis Y. Surface wraps around Y.
+                // Open part is between theta 0 and PI. 
+                // We rotate Y by -PI/2 to center the curve opening toward +Z?
+                // Let's rely on Group transforms.
+                
+                // Rotate geometry to align along Z initially
+                geometry.rotateX(-Math.PI / 2); // Now cylinder runs along Z
+                
+                // Now the "length" is Z. The "Curve" is in XY plane.
+                // We want the curve to be a "U" shape facing +Z (User). 
+                // Actually, if it runs along Z, the cross section is XY.
+                // Half pipe opening towards +Z means... wait.
+                // The tunnel runs Left-Right (X axis).
+                // So we align geometry to X axis.
+                geometry.rotateY(-Math.PI / 2); // Now runs along X.
+                
+                // Now align the "Open" part.
+                // Cylinder standard: seam at -Z? 
+                // With the rotations, the open face needs to be checked visually.
+                // We will adjust rotation.x of the mesh to aim the opening at the camera.
+                this.mesh.rotation.x = -Math.PI / 2; 
+                this.wire.rotation.x = -Math.PI / 2;
+
+                // Center position (Midpoint of A and B)
+                const midX = (positionA.x + positionB.x) / 2;
+                const midY = (positionA.y + positionB.y) / 2;
+                const midZ = (positionA.z + positionB.z) / 2;
+                this.group.position.set(midX, midY, midZ);
+
+                // Tilt to follow slope (Simple slope calculation)
+                // angle = atan2(dy, dx)
+                const dy = positionB.y - positionA.y;
+                const dx = positionB.x - positionA.x;
+                const angle = Math.atan2(dy, dx);
+                
+                this.group.rotation.z = angle;
+
+                this.group.add(this.mesh);
+                this.group.add(this.wire);
+            }
+
+            dispose() {
+                this.mesh.geometry.dispose();
+                this.wire.geometry.dispose();
+                this.group.removeFromParent();
+            }
+        }
+
+        /**
+         * Manages the stream of segments.
+         */
+        class TunnelStream {
+            constructor(scene, baseY, noiseOffset) {
+                this.scene = scene;
+                this.segments = [];
+                this.baseY = baseY;
+                this.noiseOffset = noiseOffset;
+                this.elapsed = 0;
+
+                // State for generation
+                this.tailX = CONFIG.despawnX; 
+                this.tailPos = new THREE.Vector3(this.tailX, this.baseY, CONFIG.viewZ);
+                this.tailRadius = CONFIG.baseRadius;
+
+                // Pre-warm: Generate segments until we reach spawnX
+                while(this.tailX < CONFIG.spawnX) {
+                    this.spawnSegment();
+                }
+            }
+
+            getProceduralValues(x) {
+                // Combine Sine waves for organic "Snake" look
+                // Frequency and Amplitude
+                const time = Date.now() * 0.001;
+                
+                // Y Variation (Up/Down wave)
+                const wave1 = Math.sin(x * 0.8 + time + this.noiseOffset);
+                const wave2 = Math.cos(x * 1.5 - time * 0.5);
+                const y = this.baseY + (wave1 * 0.3 + wave2 * 0.1);
+
+                // Radius Variation (Expansion/Contraction)
+                const rWave = Math.sin(x * 2.0 + this.noiseOffset * 2.0);
+                const radius = CONFIG.baseRadius + (rWave * 0.15);
+
+                return { y, radius };
+            }
+
+            spawnSegment() {
+                // Calculate Start (previous tail) and End (new)
+                const startPos = this.tailPos.clone();
+                const startRad = this.tailRadius;
+
+                const nextX = this.tailX + CONFIG.segmentWidth;
+                const proc = this.getProceduralValues(nextX);
+                
+                const endPos = new THREE.Vector3(nextX, proc.y, CONFIG.viewZ);
+                const endRad = proc.radius;
+
+                // Create Segment
+                const seg = new TunnelSegment(startPos, startRad, endPos, endRad);
+                this.scene.add(seg.group);
+                this.segments.push(seg);
+
+                // Update Tail State
+                this.tailX = nextX;
+                this.tailPos = endPos;
+                this.tailRadius = endRad;
+            }
+
+            update(delta) {
+                const shift = CONFIG.scrollSpeed * delta;
+
+                // 1. Move everything Left
+                // Note: We move the container or individual objects?
+                // Moving individual objects allows infinite scrolling without coordinate overflow.
+                
+                for(let i = this.segments.length - 1; i >= 0; i--) {
+                    const seg = this.segments[i];
+                    seg.group.position.x -= shift;
+
+                    // Despawn check
+                    if(seg.group.position.x < CONFIG.despawnX) {
+                        seg.dispose();
+                        this.segments.splice(i, 1);
+                    }
+                }
+
+                // Adjust generation tracker (it moves with the world)
+                this.tailX -= shift;
+                this.tailPos.x -= shift;
+
+                // 2. Spawn new segments if needed
+                // If tail is inside the spawn area, add more
+                while(this.tailX < CONFIG.spawnX) {
+                    this.spawnSegment();
+                }
+            }
+        }
+
+        // ============================================================================
+        // MAIN APP
+        // ============================================================================
+        let camera, scene, renderer;
+        let clock;
+        let streams = [];
+
+        init();
+        animate();
+
+        function init() {
+            // Setup Scene
+            scene = new THREE.Scene();
+
+            // Setup Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+            
+            // Setup Renderer (Alpha true for Passthrough)
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Lighting (Adds dimensionality to the cel shader)
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+            dirLight.position.set(0, 2, 2); // Top-front light
+            scene.add(dirLight);
+            
+            const ambLight = new THREE.AmbientLight(0x404040, 2); // Soft fill
+            scene.add(ambLight);
+
+            // Game Objects
+            clock = new THREE.Clock();
+            
+            // Create Top Tunnel
+            streams.push(new TunnelStream(scene, CONFIG.topTunnelY, 0));
+            // Create Bottom Tunnel
+            streams.push(new TunnelStream(scene, CONFIG.bottomTunnelY, 10));
+
+            // Setup XR
+            const arButton = ARButton.createButton(renderer, { 
+                requiredFeatures: ['local'],
+                optionalFeatures: ['dom-overlay'],
+                domOverlay: { root: document.body }
+            });
+            document.body.appendChild(arButton);
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render() {
+            const delta = clock.getDelta();
+
+            // Update Tunnels
+            streams.forEach(stream => stream.update(delta));
+
+            renderer.render(scene, camera);
+        }
+
+    </script>
+</body>
+</html>
