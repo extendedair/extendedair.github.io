@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Quest 3 MR: Asymmetric Tunnel</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; }
+    </style>
+    <!-- Import Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        // ============================================================================
+        // CONFIGURATION
+        // ============================================================================
+        const CONFIG = {
+            scrollSpeed: 1.4,
+            
+            // Spatial Boundaries
+            spawnX: 5.0,            
+            despawnX: -5.0,         
+            viewZ: -3.0,            // Pushed back slightly for better perspective
+            
+            // Generation Settings
+            segmentLength: 0.3,     
+            radSegments: 16,        // Higher for smoother cel shading
+            
+            // Tube Dimensions
+            radiusMin: 0.25,
+            radiusMax: 0.60,
+            
+            // Vertical Baselines
+            topY: 0.6,
+            bottomY: -0.6
+        };
+
+        // ============================================================================
+        // MATERIALS
+        // ============================================================================
+
+        // 1. CEL SHADER
+        // Renders the INSIDE of the tube.
+        // UV Mapping: vUv.y = 0.0 (Top Rim) -> 0.5 (Deepest Back) -> 1.0 (Bottom Rim)
+        const celMat = new THREE.ShaderMaterial({
+            uniforms: {
+                colorDeep: { value: new THREE.Color(0x0044ff) }, // Deep Blue (Center)
+                colorRim:  { value: new THREE.Color(0x888888) }  // Pale Grey (Edges)
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                varying vec3 vNormal;
+                void main() {
+                    vUv = uv;
+                    vNormal = normal;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 colorDeep;
+                uniform vec3 colorRim;
+                varying vec2 vUv;
+
+                void main() {
+                    // Calculate distance from the "spine" (0.5)
+                    // 0.0 = Spine (Blue), 1.0 = Rim (Grey)
+                    float dist = abs(vUv.y - 0.5) * 2.0;
+                    
+                    // Cel Shading: Create hard bands
+                    // 3 bands: Solid Blue Core -> Mid Tone -> Grey Edge
+                    float bands = 3.0;
+                    float stepped = floor(dist * bands) / bands;
+
+                    vec3 finalColor = mix(colorDeep, colorRim, stepped);
+                    
+                    // High opacity to ensure visibility
+                    gl_FragColor = vec4(finalColor, 0.95);
+                }
+            `,
+            side: THREE.BackSide, // Render the INSIDE face
+            transparent: true,
+            depthWrite: true,      // Proper sorting
+        });
+
+        // 2. WIREFRAME
+        // Rendered as lines on top
+        const wireMat = new THREE.LineBasicMaterial({
+            color: 0xffffff,
+            linewidth: 1,
+            transparent: true,
+            opacity: 0.5
+        });
+
+        // ============================================================================
+        // MATH & UTILS
+        // ============================================================================
+
+        /**
+         * Asymmetric Noise Function
+         * Combines multiple sine waves with distinct prime frequencies to avoid repetition.
+         */
+        function organicNoise(x, offset, freqA, freqB) {
+            return Math.sin(x * freqA + offset) * 0.7 + 
+                   Math.cos(x * freqB + offset * 1.5) * 0.3;
+        }
+
+        /**
+         * Generates Ring Data (Positions & UVs)
+         * - Creates a "C" shape.
+         * - Spine is pushed into -Z.
+         * - Opening faces +Z (Camera).
+         */
+        function getRingData(cx, cy, cz, radius, startAngle, endAngle) {
+            const positions = [];
+            const uvs = [];
+            
+            // We iterate a fixed number of segments to keep mesh density constant
+            // even as the arc angle shrinks during merge.
+            for(let i=0; i <= CONFIG.radSegments; i++) {
+                const ratio = i / CONFIG.radSegments;
+                
+                // Interpolate angle based on merge state (Start -> End)
+                const theta = startAngle + ratio * (endAngle - startAngle);
+
+                // Math for "C" shape viewed from inside:
+                // Y = cos(theta)
+                // Z = -sin(theta) (Bows away from camera)
+                const vy = cy + (radius * Math.cos(theta));
+                const vz = cz + (radius * -Math.sin(theta)); 
+                
+                positions.push(cx, vy, vz);
+
+                // UV MAPPING
+                // Crucial for Shading: Map the PHYSICAL angle to UV.y
+                // Angle 0 = Top, PI = Bottom.
+                // We normalize theta (0..PI) to (0..1)
+                // This ensures Blue is always at PI/2 (0.5), regardless of morphing.
+                const normalizedV = theta / Math.PI;
+                uvs.push(0, normalizedV); 
+            }
+            return { positions, uvs };
+        }
+
+        // ============================================================================
+        // SCENE CLASSES
+        // ============================================================================
+
+        class TunnelSegment {
+            constructor(startData, endData) {
+                this.root = new THREE.Group();
+
+                const pos = [];
+                const uv = [];
+                const indices = [];
+
+                const segs = CONFIG.radSegments;
+                const rowLen = segs + 1;
+
+                // 1. Build Arrays
+                // Start Ring
+                for(let i=0; i<startData.positions.length; i+=3) {
+                    pos.push(startData.positions[i], startData.positions[i+1], startData.positions[i+2]);
+                    uv.push(0, startData.uvs[(i/3)*2 + 1]); // U=0
+                }
+                // End Ring
+                for(let i=0; i<endData.positions.length; i+=3) {
+                    pos.push(endData.positions[i], endData.positions[i+1], endData.positions[i+2]);
+                    uv.push(1, endData.uvs[(i/3)*2 + 1]); // U=1
+                }
+
+                // 2. Build Faces
+                for(let i=0; i < segs; i++) {
+                    const a = i;
+                    const b = i + 1;
+                    const c = i + rowLen;
+                    const d = i + rowLen + 1;
+
+                    // Standard Quad made of 2 tris
+                    indices.push(a, b, d);
+                    indices.push(a, d, c);
+                }
+
+                // 3. BufferGeometry
+                const geom = new THREE.BufferGeometry();
+                geom.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+                geom.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+                geom.setIndex(indices);
+                geom.computeVertexNormals();
+
+                // 4. Mesh
+                this.mesh = new THREE.Mesh(geom, celMat);
+                
+                // 5. Wireframe (Edges only for cleanliness)
+                const wireGeo = new THREE.WireframeGeometry(geom);
+                this.wire = new THREE.LineSegments(wireGeo, wireMat);
+
+                this.root.add(this.mesh);
+                this.root.add(this.wire);
+            }
+
+            translateX(dist) {
+                this.root.position.x += dist;
+            }
+
+            dispose() {
+                this.mesh.geometry.dispose();
+                this.wire.geometry.dispose();
+                this.root.removeFromParent();
+            }
+        }
+
+        /**
+         * Controls the random paths and merging logic.
+         */
+        class Director {
+            constructor() {
+                this.time = 0;
+                
+                // Merge State
+                this.isMerged = false;
+                this.mergeFactor = 0; // 0=Split, 1=Merged
+                this.nextEvent = 5.0;
+
+                // Random Seeds (Different seeds = Asymmetry)
+                this.seedTop = Math.random() * 100;
+                this.seedBot = Math.random() * 100 + 500;
+                
+                // Different Frequencies (Different speeds of oscillation)
+                this.freqTop = 0.8;
+                this.freqBot = 1.3;
+            }
+
+            update(dt) {
+                this.time += dt;
+
+                // 1. Handle Event Timer
+                if (this.time > this.nextEvent) {
+                    this.isMerged = !this.isMerged;
+                    // Random duration for next state (4 to 9 seconds)
+                    this.nextEvent = this.time + 4 + Math.random() * 5;
+                }
+
+                // 2. Smooth Transition of Merge Factor
+                const target = this.isMerged ? 1.0 : 0.0;
+                const speed = dt * 0.8; // Transition speed
+                
+                if (this.mergeFactor < target) this.mergeFactor = Math.min(this.mergeFactor + speed, 1.0);
+                else if (this.mergeFactor > target) this.mergeFactor = Math.max(this.mergeFactor - speed, 0.0);
+            }
+
+            /**
+             * Returns geometry parameters for a specific X location.
+             */
+            getParams(isTop, x) {
+                const t = this.mergeFactor;
+
+                // --- 1. CALCULATE SPLIT STATE (CHAOTIC) ---
+                const seed = isTop ? this.seedTop : this.seedBot;
+                const freq = isTop ? this.freqTop : this.freqBot;
+                
+                // Unique noise for Y position
+                const noiseY = organicNoise(x, seed, freq, freq * 1.5); // -1 to 1 approx
+                const baseY = isTop ? CONFIG.topY : CONFIG.bottomY;
+                const ySplit = baseY + (noiseY * 0.25); // Wander up/down
+
+                // Unique noise for Radius
+                const noiseR = organicNoise(x, seed + 10, freq * 1.2, freq * 0.5);
+                const rSplit = THREE.MathUtils.mapLinear(noiseR, -1, 1, CONFIG.radiusMin, CONFIG.radiusMin * 1.6);
+
+
+                // --- 2. CALCULATE MERGED STATE (UNIFORM) ---
+                const yMerged = 0;
+                const rMerged = CONFIG.radiusMax;
+
+
+                // --- 3. LERP & MORPH ---
+                let yFinal, rFinal, startAng, endAng;
+
+                if (isTop) {
+                    // Top: Morphs from Full C to Top-Half C
+                    yFinal = THREE.MathUtils.lerp(ySplit, yMerged, t);
+                    rFinal = THREE.MathUtils.lerp(rSplit, rMerged, t);
+                    
+                    // Angle: 0..PI (Full) -> 0..PI/2 (Top Half)
+                    startAng = 0;
+                    endAng = THREE.MathUtils.lerp(Math.PI, Math.PI / 2, t);
+                } else {
+                    // Bottom: Morphs from Full C to Bottom-Half C
+                    yFinal = THREE.MathUtils.lerp(ySplit, yMerged, t);
+                    rFinal = THREE.MathUtils.lerp(rSplit, rMerged, t);
+                    
+                    // Angle: 0..PI (Full) -> PI/2..PI (Bottom Half)
+                    startAng = THREE.MathUtils.lerp(0, Math.PI / 2, t);
+                    endAng = Math.PI;
+                }
+
+                return { y: yFinal, r: rFinal, startAng, endAng };
+            }
+        }
+
+        class TunnelStream {
+            constructor(scene, director, isTop) {
+                this.scene = scene;
+                this.director = director;
+                this.isTop = isTop;
+                this.segments = [];
+                
+                this.cursorX = CONFIG.despawnX;
+
+                // Init Tail
+                const p = this.director.getParams(this.isTop, this.cursorX);
+                this.tailData = getRingData(this.cursorX, p.y, CONFIG.viewZ, p.r, p.startAng, p.endAng);
+
+                // Fill Screen
+                while(this.cursorX < CONFIG.spawnX) {
+                    this.spawnSegment();
+                }
+            }
+
+            spawnSegment() {
+                const nextX = this.cursorX + CONFIG.segmentLength;
+                const p = this.director.getParams(this.isTop, nextX);
+                
+                const nextData = getRingData(nextX, p.y, CONFIG.viewZ, p.r, p.startAng, p.endAng);
+
+                const seg = new TunnelSegment(this.tailData, nextData);
+                this.scene.add(seg.root);
+                this.segments.push(seg);
+
+                this.cursorX = nextX;
+                this.tailData = nextData;
+            }
+
+            update(dt) {
+                const shift = CONFIG.scrollSpeed * dt;
+
+                // Move Visuals
+                for(let i = this.segments.length-1; i >= 0; i--) {
+                    const seg = this.segments[i];
+                    seg.translateX(-shift);
+                }
+
+                // Adjust Logic Cursor
+                this.cursorX -= shift;
+                // Adjust cached data (so next segment attaches correctly in space)
+                for(let i=0; i<this.tailData.positions.length; i+=3) {
+                    this.tailData.positions[i] -= shift;
+                }
+
+                // Spawn New
+                while(this.cursorX < CONFIG.spawnX) {
+                    this.spawnSegment();
+                }
+
+                // Cleanup Old
+                const maxSegs = Math.ceil((CONFIG.spawnX - CONFIG.despawnX) / CONFIG.segmentLength) + 4;
+                if(this.segments.length > maxSegs) {
+                    const old = this.segments.shift();
+                    old.dispose();
+                }
+            }
+        }
+
+        // ============================================================================
+        // MAIN
+        // ============================================================================
+        let camera, scene, renderer;
+        let director, topStream, botStream;
+        let clock;
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            
+            // Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 20);
+            
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Light: Ambient helps the Blue pop inside the transparent shader
+            const ambient = new THREE.AmbientLight(0xffffff, 1.0);
+            scene.add(ambient);
+            
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.5);
+            dirLight.position.set(0, 0, 1); // Front light
+            scene.add(dirLight);
+
+            // Logic
+            clock = new THREE.Clock();
+            director = new Director();
+
+            topStream = new TunnelStream(scene, director, true);
+            botStream = new TunnelStream(scene, director, false);
+
+            // XR UI
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local'] }));
+            
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+        }
+
+        function render() {
+            const dt = clock.getDelta();
+
+            director.update(dt);
+            topStream.update(dt);
+            botStream.update(dt);
+
+            renderer.render(scene, camera);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+    </script>
+</body>
+</html>
