@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Quest 3 Trench Run - Cel Shaded</title>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; }
+        #overlay {
+            position: absolute; top: 20px; left: 0; width: 100%;
+            text-align: center; color: cyan; font-family: 'Courier New', Courier, monospace;
+            font-weight: bold; text-shadow: 0 0 5px cyan; pointer-events: none;
+            z-index: 999;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">
+        TARGETING COMPUTER ACTIVE<br>
+        <span style="font-size:0.8em">Press Start AR - Look slightly down</span>
+    </div>
+
+    <!-- Import Three.js and WebXR Addons -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let trenchContainer;
+        const chunks = [];
+        
+        // --- Settings ---
+        const CHUNK_SIZE = 10;      // Length of one trench segment
+        const CHUNK_COUNT = 10;     // How many segments to draw
+        const TRENCH_WIDTH = 6;
+        const TRENCH_HEIGHT = 4;
+        const SPEED = 12.0;         // Speed of scrolling
+        const TILT_ANGLE = Math.PI / 6; // 30 degrees
+
+        // --- Cel Shading Setup ---
+        // Create a simple gradient texture for the Toon Material to force "bands" of light
+        const format = ( renderer?.capabilities.isWebGL2 ) ? THREE.RedFormat : THREE.LuminanceFormat;
+        const gradientColors = new Uint8Array([0, 80, 150, 255]); // 4 steps of brightness
+        const gradientMap = new THREE.DataTexture(gradientColors, 4, 1, format);
+        gradientMap.needsUpdate = true;
+        gradientMap.minFilter = THREE.NearestFilter;
+        gradientMap.magFilter = THREE.NearestFilter;
+
+        // Materials
+        const baseMaterial = new THREE.MeshToonMaterial({
+            color: 0x222222,     // Dark Grey Base
+            gradientMap: gradientMap,
+            side: THREE.FrontSide
+        });
+
+        const featureMaterial = new THREE.MeshToonMaterial({
+            color: 0x555555,     // Lighter Grey for objects
+            gradientMap: gradientMap
+        });
+
+        const lineMaterial = new THREE.LineBasicMaterial({
+            color: 0x00FFFF,     // Cyan Wireframe
+            linewidth: 2
+        });
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            // Background null for AR Passthrough
+            scene.background = null;
+
+            // Camera setup: 3rd person chase view
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Lighting is critical for Toon/Cel shading
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+            dirLight.position.set(5, 10, 5); // Light from top-right
+            scene.add(dirLight);
+            
+            const ambLight = new THREE.AmbientLight(0x404040, 0.5); // Soft fill
+            scene.add(ambLight);
+
+            // Container to handle the 30-degree slope
+            trenchContainer = new THREE.Group();
+            // Position: slightly below eye level, tilted
+            trenchContainer.position.set(0, -1, -2);
+            // Rotate X: Negative tilts the far end UP, Positive tilts far end DOWN.
+            // User asked for "sloping down towards player", meaning the far end is higher.
+            trenchContainer.rotation.x = -TILT_ANGLE; 
+            scene.add(trenchContainer);
+
+            // Initial Generation
+            for (let i = 0; i < CHUNK_COUNT; i++) {
+                const zPos = -i * CHUNK_SIZE; // Generate into the screen
+                const chunk = generateChunk(zPos);
+                chunks.push(chunk);
+                trenchContainer.add(chunk);
+            }
+
+            // WebXR Button
+            const arBtn = ARButton.createButton(renderer, {
+                requiredFeatures: ['hit-test'],
+                optionalFeatures: ['dom-overlay'],
+                domOverlay: { root: document.body }
+            });
+            document.body.appendChild(arBtn);
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        // --- Helper: Create a Cel-Shaded Mesh with Outline ---
+        function createCelMesh(geometry, material) {
+            const group = new THREE.Group();
+            
+            // 1. Solid Mesh
+            const mesh = new THREE.Mesh(geometry, material);
+            group.add(mesh);
+
+            // 2. Wireframe Outline
+            const edges = new THREE.EdgesGeometry(geometry);
+            const line = new THREE.LineSegments(edges, lineMaterial);
+            group.add(line);
+
+            return group;
+        }
+
+        // --- Generator Logic ---
+        function generateChunk(zPos) {
+            const chunkGroup = new THREE.Group();
+            chunkGroup.position.z = zPos;
+
+            // 1. The Trench "U" Shape
+            
+            // Floor
+            const floorGeo = new THREE.BoxGeometry(TRENCH_WIDTH, 0.5, CHUNK_SIZE);
+            const floor = createCelMesh(floorGeo, baseMaterial);
+            floor.position.set(0, -0.25, 0);
+            chunkGroup.add(floor);
+
+            // Left Wall
+            const wallGeo = new THREE.BoxGeometry(1, TRENCH_HEIGHT, CHUNK_SIZE);
+            const leftWall = createCelMesh(wallGeo, baseMaterial);
+            leftWall.position.set(-(TRENCH_WIDTH/2 + 0.5), TRENCH_HEIGHT/2 - 0.25, 0);
+            chunkGroup.add(leftWall);
+
+            // Right Wall
+            const rightWall = createCelMesh(wallGeo, baseMaterial);
+            rightWall.position.set((TRENCH_WIDTH/2 + 0.5), TRENCH_HEIGHT/2 - 0.25, 0);
+            chunkGroup.add(rightWall);
+
+            // 2. Random Features (The "Greebles")
+            // We'll generate a few items per chunk
+            const numFeatures = Math.floor(Math.random() * 3) + 1;
+
+            for(let i=0; i<numFeatures; i++) {
+                const type = Math.random();
+                // Random Z within this chunk
+                const fZ = (Math.random() - 0.5) * (CHUNK_SIZE - 2); 
+
+                if (type < 0.3) {
+                    // TURRET (Floor feature)
+                    const tGeo = new THREE.BoxGeometry(0.8, 0.8, 0.8);
+                    const turret = createCelMesh(tGeo, featureMaterial);
+                    // Random X on floor
+                    const fX = (Math.random() - 0.5) * (TRENCH_WIDTH - 2);
+                    turret.position.set(fX, 0.4, fZ);
+                    chunkGroup.add(turret);
+                } 
+                else if (type < 0.7) {
+                    // PIPE/OUTCROP (Wall feature)
+                    const side = Math.random() > 0.5 ? 1 : -1;
+                    const pGeo = new THREE.CylinderGeometry(0.3, 0.3, 1.5, 8);
+                    // Rotate cylinder to stick out of wall
+                    pGeo.rotateZ(Math.PI / 2);
+                    const pipe = createCelMesh(pGeo, featureMaterial);
+                    
+                    const pX = side * (TRENCH_WIDTH/2 - 0.5);
+                    const pY = Math.random() * (TRENCH_HEIGHT - 1) + 0.5;
+                    
+                    pipe.position.set(pX, pY, fZ);
+                    chunkGroup.add(pipe);
+                } 
+                else {
+                    // BRIDGE (Overhead)
+                    const bGeo = new THREE.BoxGeometry(TRENCH_WIDTH, 0.4, 1);
+                    const bridge = createCelMesh(bGeo, featureMaterial);
+                    // High up
+                    bridge.position.set(0, TRENCH_HEIGHT - 1, fZ);
+                    chunkGroup.add(bridge);
+                }
+            }
+
+            return chunkGroup;
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        const clock = new THREE.Clock();
+
+        function render() {
+            const dt = clock.getDelta();
+            
+            // Move chunks along Z to simulate forward movement
+            // Since -Z is "forward" into the distance, moving objects +Z makes them come closer
+            const moveDist = SPEED * dt;
+
+            chunks.forEach(chunk => {
+                chunk.position.z += moveDist;
+
+                // Recycling:
+                // If chunk passes the camera (Z > some positive buffer), move it to the back
+                if (chunk.position.z > CHUNK_SIZE) {
+                    // Move it to the very end of the line
+                    // Current Z is roughly CHUNK_SIZE. We need to subtract Total Length.
+                    // Total Length = CHUNK_COUNT * CHUNK_SIZE
+                    chunk.position.z -= (CHUNK_COUNT * CHUNK_SIZE);
+
+                    // Optional: To make it truly random every time, we could remove 
+                    // children and regenerate, but simpler is just to randomize visibility
+                    // of the feature objects (children indices 3, 4, 5...)
+                    for(let i=3; i<chunk.children.length; i++) {
+                        chunk.children[i].visible = Math.random() > 0.3;
+                    }
+                }
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+    </script>
+</body>
+</html>
