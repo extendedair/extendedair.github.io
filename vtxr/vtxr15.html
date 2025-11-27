@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Quest 3 Trench: Targets</title>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; }
+        #overlay {
+            position: absolute; top: 20px; left: 0; width: 100%;
+            text-align: center; color: #ffffff; font-family: 'Courier New', Courier, monospace;
+            font-weight: bold; text-shadow: 0 0 4px #000000; pointer-events: none;
+            z-index: 999;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">
+        // TRENCH TARGETS //<br>
+        <span style="font-size:0.8em">Left Stick: Fly | Right Trigger: Fire</span>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let trenchContainer, shipGroup;
+        const chunks = []; 
+        let audioCtx;
+
+        // --- Config from Last Working Version ---
+        const CHUNK_SIZE = 12;
+        const CHUNK_COUNT = 16;
+        const TRENCH_WIDTH = 8;
+        const TRENCH_HEIGHT = 6;
+        const SCROLL_SPEED = 18.75; 
+        const TILT_ANGLE = THREE.MathUtils.degToRad(10); 
+        
+        // Ship
+        const SHIP_Z_POS = -17.0; 
+        const SHIP_SPEED = 0.15; 
+        const SHIP_LIMIT_X = 3.2;
+        const SHIP_LIMIT_Y_MIN = 0.5;
+        const SHIP_LIMIT_Y_MAX = 5.5;
+
+        // Game State
+        const bullets = [];
+        const particles = [];
+        let isInvulnerable = false;
+        let respawnTimer = 0;
+        let fireCooldown = 0;
+
+        // --- NEW: Target State ---
+        let activeTargetCount = 0;
+        const MAX_TARGETS = 3;
+
+        // --- Materials ---
+        const format = ( window.WebGL2RenderingContext ) ? THREE.RedFormat : THREE.LuminanceFormat;
+        const gradientMap = new THREE.DataTexture(new Uint8Array([60, 100, 140, 255]), 4, 1, format);
+        gradientMap.needsUpdate = true;
+        gradientMap.minFilter = THREE.NearestFilter;
+        gradientMap.magFilter = THREE.NearestFilter;
+
+        const matTrench = new THREE.MeshToonMaterial({ color: 0x555555, gradientMap: gradientMap });
+        const matFeature = new THREE.MeshToonMaterial({ color: 0x777777, gradientMap: gradientMap });
+        const matTall = new THREE.MeshToonMaterial({ color: 0x888899, gradientMap: gradientMap });
+        const matLine = new THREE.LineBasicMaterial({ color: 0xbbbbbb, linewidth: 1, opacity: 0.5, transparent: true });
+
+        const matShipBody = new THREE.MeshToonMaterial({ color: 0xeeeeee, gradientMap: gradientMap });
+        const matShipDetail = new THREE.MeshToonMaterial({ color: 0xcc0000, gradientMap: gradientMap });
+        const matEngine = new THREE.MeshBasicMaterial({ color: 0xffaa00 });
+        const matBullet = new THREE.MeshBasicMaterial({ color: 0x00ffff });
+        const matExplosion = new THREE.MeshBasicMaterial({ color: 0xffaa00 });
+        
+        // NEW: Target Material
+        const matTarget = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = null; 
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 150);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+            dirLight.position.set(0, 20, 10); 
+            scene.add(dirLight);
+            scene.add(new THREE.AmbientLight(0x404040, 1.0));
+
+            // Setup Trench Container
+            trenchContainer = new THREE.Group();
+            trenchContainer.position.set(0, -6.0, -2.0);
+            trenchContainer.rotation.x = TILT_ANGLE;
+            scene.add(trenchContainer);
+
+            // Initialize Chunks
+            // We use a fixed number of Group objects and reuse them
+            for(let i=0; i<CHUNK_COUNT; i++) {
+                const group = new THREE.Group();
+                const z = -i * CHUNK_SIZE;
+                group.position.z = z;
+                
+                // Fill with content
+                generateChunkContent(group);
+                
+                chunks.push(group);
+                trenchContainer.add(group);
+            }
+
+            // Ship
+            shipGroup = createVoxelShip();
+            shipGroup.position.set(0, 2.0, SHIP_Z_POS); 
+            trenchContainer.add(shipGroup);
+
+            // Audio Setup
+            const setupAudio = () => {
+                if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if(audioCtx.state === 'suspended') audioCtx.resume();
+            };
+            document.body.addEventListener('click', setupAudio);
+            
+            const arBtn = ARButton.createButton(renderer, {
+                requiredFeatures: ['hit-test', 'local-floor'],
+                optionalFeatures: ['dom-overlay'],
+                domOverlay: { root: document.body }
+            });
+            arBtn.addEventListener('click', setupAudio);
+            document.body.appendChild(arBtn);
+
+            window.addEventListener('resize', onResize);
+        }
+
+        // --- Generation Logic ---
+
+        function generateChunkContent(group) {
+            // 1. Clear existing content (Recycling logic)
+            // If this chunk had targets, release them from the global count
+            if(group.userData.targetCount) {
+                activeTargetCount -= group.userData.targetCount;
+                group.userData.targetCount = 0; // Reset
+            }
+
+            // Remove old meshes
+            while(group.children.length > 0) {
+                const child = group.children[0];
+                group.remove(child);
+                if(child.geometry) child.geometry.dispose();
+            }
+
+            // 2. Build Basic Trench Geometry
+            // Floor
+            const floor = new THREE.Mesh(new THREE.BoxGeometry(TRENCH_WIDTH, 1, CHUNK_SIZE), matTrench);
+            floor.position.y = -0.5;
+            floor.add(new THREE.LineSegments(new THREE.EdgesGeometry(floor.geometry), matLine));
+            group.add(floor);
+
+            // Walls
+            const wGeo = new THREE.BoxGeometry(1, TRENCH_HEIGHT, CHUNK_SIZE);
+            const lw = new THREE.Mesh(wGeo, matTrench);
+            lw.position.set(-(TRENCH_WIDTH/2 + 0.5), TRENCH_HEIGHT/2 - 0.5, 0);
+            lw.add(new THREE.LineSegments(new THREE.EdgesGeometry(wGeo), matLine));
+            group.add(lw);
+            
+            const rw = new THREE.Mesh(wGeo, matTrench);
+            rw.position.set((TRENCH_WIDTH/2 + 0.5), TRENCH_HEIGHT/2 - 0.5, 0);
+            rw.add(new THREE.LineSegments(new THREE.EdgesGeometry(wGeo), matLine));
+            group.add(rw);
+
+            // 3. Add Obstacles & Targets
+            group.userData.targetCount = 0;
+
+            for(let k=0; k<3; k++) {
+                if(Math.random() > 0.4) {
+                    const type = Math.random();
+                    const lz = (Math.random()-0.5)*(CHUNK_SIZE*0.9);
+                    let obs = null;
+                    let canHaveTarget = false;
+
+                    // Obstacle Types
+                    if(type < 0.25) { // Bridge
+                        const h = Math.random() * 2.0 + 2.5;
+                        obs = createCelMesh(new THREE.BoxGeometry(TRENCH_WIDTH, 0.5, 1), matFeature);
+                        obs.position.set(0, h, lz);
+                        canHaveTarget = true;
+                    } 
+                    else if(type < 0.5) { // Turret
+                        obs = createCelMesh(new THREE.BoxGeometry(1.2,1,1.2), matFeature);
+                        obs.position.set((Math.random()-0.5)*(TRENCH_WIDTH-2), 0.5, lz);
+                        canHaveTarget = true;
+                    } 
+                    else if(type < 0.75) { // Tall Block
+                        const h = 2 + Math.random();
+                        obs = createCelMesh(new THREE.BoxGeometry(1.2, h, 1.2), matTall);
+                        const xPos = (Math.random() > 0.5 ? 1 : -1) * (Math.random() * 1.5 + 1);
+                        obs.position.set(xPos, h/2, lz);
+                        canHaveTarget = true;
+                    }
+                    else { // Pipe
+                        obs = createCelMesh(new THREE.CylinderGeometry(0.4,0.4,1.5, 8), matFeature);
+                        obs.children[0].rotation.z = Math.PI/2;
+                        const s = Math.random()>0.5?1:-1;
+                        obs.position.set(s*(TRENCH_WIDTH/2 - 0.5), 2.5, lz);
+                    }
+
+                    if(obs) {
+                        // NEW: Target Logic
+                        // Check global limit, check if obstacle type supports it, and random chance
+                        if(canHaveTarget && activeTargetCount < MAX_TARGETS && Math.random() > 0.6) {
+                            const tGeo = new THREE.CircleGeometry(0.35, 16);
+                            const tMesh = new THREE.Mesh(tGeo, matTarget);
+                            
+                            // Attach to front face. 
+                            // Obstacles are roughly depth 1.0 or 1.2. 
+                            // Local +Z is the "front" facing the player (since player is at negative Z looking down).
+                            tMesh.position.z = 0.65; // Just slightly in front of a 1.2 depth box center (0.6)
+                            
+                            obs.add(tMesh);
+                            
+                            activeTargetCount++;
+                            group.userData.targetCount++;
+                        }
+                        group.add(obs);
+                    }
+                }
+            }
+        }
+
+        function createCelMesh(geo, mat) {
+            const g = new THREE.Group();
+            const m = new THREE.Mesh(geo, mat);
+            g.add(m);
+            g.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), matLine));
+            g.userData.isObstacle = true;
+            return g;
+        }
+
+        function createVoxelShip() {
+            const ship = new THREE.Group();
+            const s = 0.15; 
+            const geo = new THREE.BoxGeometry(s,s,s);
+            const add = (x,y,z,mat) => {
+                const m = new THREE.Mesh(geo,mat);
+                m.position.set(x*s, y*s, z*s);
+                ship.add(m);
+            };
+            // Fuselage
+            for(let z=-4; z<=3; z++) add(0,0,z, matShipBody);
+            add(0,0,-5, matShipDetail); add(0,0.8,0, matShipDetail); 
+            // Wings
+            for(let i=1; i<=5; i++) {
+                add(-i, i*0.25, 1, matShipBody); add(i, i*0.25, 1, matShipBody);
+                add(-i, -i*0.25, 1, matShipBody); add(i, -i*0.25, 1, matShipBody);
+                if(i===5) { 
+                   add(-i, i*0.25, -1, matTrench); add(i, i*0.25, -1, matTrench);
+                   add(-i, -i*0.25, -1, matTrench); add(i, -i*0.25, -1, matTrench); 
+                }
+            }
+            // Engines
+            add(-1.5, 0.5, 2, matShipDetail); add(1.5, 0.5, 2, matShipDetail);
+            add(-1.5, -0.5, 2, matShipDetail); add(1.5, -0.5, 2, matShipDetail);
+            // Glow
+            const glowGeo = new THREE.BoxGeometry(s*0.8, s*0.8, s*0.1);
+            const addGlow = (x,y) => {
+                const m = new THREE.Mesh(glowGeo, matEngine);
+                m.position.set(x*s, y*s, 2*s + 0.05);
+                ship.add(m);
+            };
+            addGlow(-1.5, 0.5); addGlow(1.5, 0.5); addGlow(-1.5, -0.5); addGlow(1.5, -0.5);
+            return ship;
+        }
+
+        function playExplosionSound() {
+            if(!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            const bufferSize = audioCtx.sampleRate * 0.5;
+            const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0);
+            for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+            const noise = audioCtx.createBufferSource();
+            noise.buffer = buffer;
+            noise.connect(gain);
+            gain.connect(audioCtx.destination);
+            gain.gain.setValueAtTime(0.5, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+            noise.start();
+            noise.stop(audioCtx.currentTime + 0.3);
+        }
+
+        // --- Game Logic ---
+
+        function fire() {
+            if(fireCooldown > 0 || bullets.length >= 6) return;
+            fireCooldown = 0.2; 
+            const createB = (offsetX) => {
+                const b = new THREE.Mesh(new THREE.SphereGeometry(0.15), matBullet);
+                b.position.copy(shipGroup.position);
+                b.position.x += offsetX;
+                b.position.y += 0.25; 
+                b.position.z -= 1.0;  
+                trenchContainer.add(b);
+                bullets.push(b);
+            };
+            createB(-1.2); createB(1.2);
+        }
+
+        function createExplosion(pos) {
+            playExplosionSound();
+            for(let i=0; i<8; i++) {
+                const p = new THREE.Mesh(new THREE.BoxGeometry(0.2,0.2,0.2), matExplosion);
+                p.position.copy(pos);
+                p.userData.vel = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize().multiplyScalar(Math.random()*5);
+                p.userData.life = 1.0;
+                trenchContainer.add(p);
+                particles.push(p);
+            }
+        }
+
+        function handleCollision() {
+            if(isInvulnerable) return;
+            createExplosion(shipGroup.position);
+            isInvulnerable = true;
+            respawnTimer = 2.0;
+        }
+
+        const shipBox = new THREE.Box3();
+        const obsBox = new THREE.Box3();
+
+        function checkCollisions() {
+            if(isInvulnerable) return;
+            shipBox.setFromObject(shipGroup);
+            shipBox.expandByScalar(-0.1); 
+
+            for(const chunk of chunks) {
+                if(Math.abs(chunk.position.z - SHIP_Z_POS) < CHUNK_SIZE) {
+                    for(const child of chunk.children) {
+                        if(child.userData.isObstacle) {
+                            obsBox.setFromObject(child);
+                            if(shipBox.intersectsBox(obsBox)) {
+                                handleCollision();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        function updateEntities(dt) {
+            if(isInvulnerable) {
+                respawnTimer -= dt;
+                if(respawnTimer <= 0) {
+                    isInvulnerable = false;
+                    shipGroup.visible = true;
+                } else {
+                    shipGroup.visible = Math.floor(respawnTimer * 10) % 2 === 0;
+                }
+            }
+            // Bullets
+            for(let i=bullets.length-1; i>=0; i--) {
+                const b = bullets[i];
+                b.position.z -= 40 * dt; 
+                if(b.position.z < -60) {
+                    trenchContainer.remove(b);
+                    bullets.splice(i, 1);
+                }
+            }
+            // Particles
+            for(let i=particles.length-1; i>=0; i--) {
+                const p = particles[i];
+                p.position.addScaledVector(p.userData.vel, dt);
+                p.userData.life -= dt;
+                p.scale.multiplyScalar(0.9);
+                if(p.userData.life <= 0) {
+                    trenchContainer.remove(p);
+                    particles.splice(i, 1);
+                }
+            }
+        }
+
+        const clock = new THREE.Clock();
+
+        function render() {
+            const dt = clock.getDelta();
+            
+            // Input
+            if(fireCooldown > 0) fireCooldown -= dt;
+            const session = renderer.xr.getSession();
+            if(session) {
+                for(const src of session.inputSources) {
+                    if(src.gamepad) {
+                        if(src.handedness === 'left' && src.gamepad.axes.length >= 4) {
+                            const x = src.gamepad.axes[2];
+                            const y = src.gamepad.axes[3];
+                            shipGroup.position.x += x * SHIP_SPEED;
+                            shipGroup.position.y -= y * SHIP_SPEED;
+                            shipGroup.rotation.z = -x * 0.4; 
+                            shipGroup.rotation.x = y * 0.2;
+                            shipGroup.position.x = Math.max(-SHIP_LIMIT_X, Math.min(SHIP_LIMIT_X, shipGroup.position.x));
+                            shipGroup.position.y = Math.max(SHIP_LIMIT_Y_MIN, Math.min(SHIP_LIMIT_Y_MAX, shipGroup.position.y));
+                        }
+                        if(src.gamepad.buttons[0]?.pressed || src.gamepad.buttons[4]?.pressed) fire();
+                    }
+                }
+            }
+
+            checkCollisions();
+            updateEntities(dt);
+
+            // Infinite Scroll
+            const move = SCROLL_SPEED * dt;
+            
+            // Calculate minimum Z (furthest back chunk)
+            let minZ = 1000;
+            for(const c of chunks) minZ = Math.min(minZ, c.position.z);
+
+            for(const chunk of chunks) {
+                chunk.position.z += move;
+                
+                // If chunk passes camera (approx z > 8), recycle it
+                if(chunk.position.z > 8) {
+                    // Move to the back of the line
+                    chunk.position.z = minZ - CHUNK_SIZE;
+                    
+                    // REGENERATE CONTENT
+                    // This fixes the "running out" bug by keeping the array size constant
+                    // but completely refreshing the geometry/targets
+                    generateChunkContent(chunk);
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function onResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+    </script>
+</body>
+</html>
