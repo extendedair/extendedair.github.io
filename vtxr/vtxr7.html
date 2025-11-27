@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Quest 3 Trench Run: Grey Edition</title>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; }
+        #overlay {
+            position: absolute; top: 20px; left: 0; width: 100%;
+            text-align: center; color: #cccccc; font-family: 'Courier New', Courier, monospace;
+            font-weight: bold; text-shadow: 0 0 5px #ffffff; pointer-events: none;
+            z-index: 999;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">
+        // TRENCH RUN: -40&deg; OFFSET //<br>
+        <span style="font-size:0.8em">Left Stick: Fly | Visuals: Mid-Grey</span>
+    </div>
+
+    <!-- Import Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let trenchContainer, shipGroup;
+        const chunks = [];
+
+        // --- Settings ---
+        const CHUNK_SIZE = 12;
+        const CHUNK_COUNT = 12;
+        const TRENCH_WIDTH = 8;
+        const TRENCH_HEIGHT = 5;
+        const SCROLL_SPEED = 20.0;
+        
+        // ANGLE: -40 Degrees (Negative tilts the Far End UP)
+        const TILT_ANGLE = THREE.MathUtils.degToRad(-40); 
+
+        // Ship Logic
+        const SHIP_SPEED = 0.15;
+        const SHIP_LIMIT_X = 3.2;
+        const SHIP_LIMIT_Y_MIN = 0.5;
+        const SHIP_LIMIT_Y_MAX = 4.5;
+
+        // --- Materials (Grey Theme) ---
+        const format = ( window.WebGL2RenderingContext ) ? THREE.RedFormat : THREE.LuminanceFormat;
+        // Mid-grey gradient steps
+        const gradientColors = new Uint8Array([80, 120, 180, 255]); 
+        const gradientMap = new THREE.DataTexture(gradientColors, 4, 1, format);
+        gradientMap.needsUpdate = true;
+        gradientMap.minFilter = THREE.NearestFilter;
+        gradientMap.magFilter = THREE.NearestFilter;
+
+        // 1. Trench: Mid Grey
+        const matTrench = new THREE.MeshToonMaterial({ color: 0x666666, gradientMap: gradientMap });
+        
+        // 2. Features: Slightly lighter grey
+        const matFeature = new THREE.MeshToonMaterial({ color: 0x888888, gradientMap: gradientMap });
+        
+        // 3. Wireframe: Pale Grey
+        const matLine = new THREE.LineBasicMaterial({ color: 0xbbbbbb, linewidth: 1.5, opacity: 0.8, transparent: true });
+
+        // 4. Ship: Original Voxel Colors
+        const matShipBody = new THREE.MeshToonMaterial({ color: 0xdddddd, gradientMap: gradientMap });
+        const matShipDetail = new THREE.MeshToonMaterial({ color: 0xff3333, gradientMap: gradientMap });
+        const matEngine = new THREE.MeshBasicMaterial({ color: 0xffaa00 });
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = null; // AR Transparency
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Lighting
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+            dirLight.position.set(0, 10, 5);
+            scene.add(dirLight);
+            scene.add(new THREE.AmbientLight(0x404040, 0.8));
+
+            // --- World Container ---
+            trenchContainer = new THREE.Group();
+            
+            // POSITIONING:
+            // 1. We drop the container significantly (-1.8) to simulate the player being "higher" (View up 30%).
+            // 2. We push it forward (-1.5) so it doesn't intersect the player's torso.
+            trenchContainer.position.set(0, -1.8, -1.5);
+
+            // ROTATION:
+            // -40 Degrees. Far end goes UP.
+            trenchContainer.rotation.x = TILT_ANGLE;
+
+            scene.add(trenchContainer);
+
+            // Generate Chunks
+            for(let i=0; i<CHUNK_COUNT; i++) {
+                // Generate deep into the distance (-Z)
+                const z = -i * CHUNK_SIZE;
+                const chunk = createChunk(z);
+                chunks.push(chunk);
+                trenchContainer.add(chunk);
+            }
+
+            // Create Ship
+            shipGroup = createVoxelShip();
+            // Position relative to trench: 
+            // x=0, y=1.5 (hover), z=2 (Slightly "up" the ramp relative to origin, but visible)
+            shipGroup.position.set(0, 1.5, 2); 
+            trenchContainer.add(shipGroup);
+
+            // WebXR Button
+            document.body.appendChild(ARButton.createButton(renderer, {
+                requiredFeatures: ['hit-test', 'local-floor'],
+                optionalFeatures: ['dom-overlay'],
+                domOverlay: { root: document.body }
+            }));
+
+            window.addEventListener('resize', onResize);
+        }
+
+        // --- Generator Functions ---
+
+        function createVoxelShip() {
+            const ship = new THREE.Group();
+            const s = 0.12; 
+            const geo = new THREE.BoxGeometry(s,s,s);
+            
+            const add = (x,y,z,mat) => {
+                const m = new THREE.Mesh(geo,mat);
+                m.position.set(x*s, y*s, z*s);
+                ship.add(m);
+            };
+
+            // Fuselage
+            for(let z=-4; z<=3; z++) add(0,0,z, matShipBody);
+            add(0,0,-5, matShipDetail); 
+            add(0,0.8,0, matShipDetail);
+
+            // Wings
+            for(let i=1; i<=5; i++) {
+                add(-i, i*0.25, 1, matShipBody);
+                add(i, i*0.25, 1, matShipBody);
+                add(-i, -i*0.25, 1, matShipBody);
+                add(i, -i*0.25, 1, matShipBody);
+                
+                if(i===5) { // Cannons
+                   add(-i, i*0.25, -1, matFeature);
+                   add(i, i*0.25, -1, matFeature);
+                   add(-i, -i*0.25, -1, matFeature);
+                   add(i, -i*0.25, -1, matFeature); 
+                }
+            }
+            
+            // Engines
+            add(-1.5, 0.5, 2, matShipDetail); add(1.5, 0.5, 2, matShipDetail);
+            add(-1.5, -0.5, 2, matShipDetail); add(1.5, -0.5, 2, matShipDetail);
+
+            // Glows
+            const glowGeo = new THREE.BoxGeometry(s*0.8, s*0.8, s*0.1);
+            const addGlow = (x,y) => {
+                const m = new THREE.Mesh(glowGeo, matEngine);
+                m.position.set(x*s, y*s, 2*s + 0.05);
+                ship.add(m);
+            };
+            addGlow(-1.5, 0.5); addGlow(1.5, 0.5);
+            addGlow(-1.5, -0.5); addGlow(1.5, -0.5);
+
+            const l = new THREE.PointLight(0xffaa00, 1, 4);
+            l.position.set(0,0,1);
+            ship.add(l);
+
+            return ship;
+        }
+
+        function createCelMesh(geo, mat) {
+            const g = new THREE.Group();
+            g.add(new THREE.Mesh(geo, mat));
+            g.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), matLine));
+            return g;
+        }
+
+        function createChunk(z) {
+            const g = new THREE.Group();
+            g.position.z = z;
+
+            // Floor
+            const floor = createCelMesh(new THREE.BoxGeometry(TRENCH_WIDTH, 1, CHUNK_SIZE), matTrench);
+            floor.position.y = -0.5;
+            g.add(floor);
+
+            // Walls
+            const wGeo = new THREE.BoxGeometry(1, TRENCH_HEIGHT, CHUNK_SIZE);
+            const lw = createCelMesh(wGeo, matTrench);
+            lw.position.set(-(TRENCH_WIDTH/2 + 0.5), TRENCH_HEIGHT/2 - 0.5, 0);
+            g.add(lw);
+            
+            const rw = createCelMesh(wGeo, matTrench);
+            rw.position.set((TRENCH_WIDTH/2 + 0.5), TRENCH_HEIGHT/2 - 0.5, 0);
+            g.add(rw);
+
+            // Features
+            if(Math.random() > 0.3) {
+                const type = Math.random();
+                const lz = (Math.random()-0.5)*(CHUNK_SIZE*0.7);
+                
+                if(type < 0.3) {
+                    // Bridge
+                    const b = createCelMesh(new THREE.BoxGeometry(TRENCH_WIDTH, 0.5, 1), matFeature);
+                    b.position.set(0, 3.5, lz);
+                    g.add(b);
+                } else if(type < 0.6) {
+                    // Turret
+                    const t = createCelMesh(new THREE.BoxGeometry(1,1,1), matFeature);
+                    t.position.set((Math.random()-0.5)*(TRENCH_WIDTH-2), 0.5, lz);
+                    g.add(t);
+                } else {
+                    // Pipes
+                    const p = createCelMesh(new THREE.CylinderGeometry(0.3,0.3,1.5, 8), matFeature);
+                    p.rotation.z = Math.PI/2;
+                    const s = Math.random()>0.5?1:-1;
+                    p.position.set(s*(TRENCH_WIDTH/2 - 0.5), 2.5, lz);
+                    g.add(p);
+                }
+            }
+            return g;
+        }
+
+        // --- Logic ---
+
+        function handleInput() {
+            const session = renderer.xr.getSession();
+            if(!session) return;
+            for(const src of session.inputSources) {
+                if(src.handedness === 'left' && src.gamepad) {
+                    const axes = src.gamepad.axes;
+                    if(axes.length >= 4) {
+                        const x = axes[2];
+                        const y = axes[3];
+                        
+                        if(shipGroup) {
+                            shipGroup.position.x -= x * SHIP_SPEED;
+                            shipGroup.position.y -= y * SHIP_SPEED;
+                            
+                            // Bank
+                            shipGroup.rotation.z = x * 0.4;
+                            shipGroup.rotation.x = y * 0.2;
+
+                            // Clamp
+                            shipGroup.position.x = Math.max(-SHIP_LIMIT_X, Math.min(SHIP_LIMIT_X, shipGroup.position.x));
+                            shipGroup.position.y = Math.max(SHIP_LIMIT_Y_MIN, Math.min(SHIP_LIMIT_Y_MAX, shipGroup.position.y));
+                        }
+                    }
+                }
+            }
+        }
+
+        function onResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        const clock = new THREE.Clock();
+
+        function render() {
+            const dt = clock.getDelta();
+            handleInput();
+
+            // Scroll Chunks (+Z is towards player)
+            const move = SCROLL_SPEED * dt;
+            
+            // Find lowest Z to stick recycling chunks onto
+            let minZ = 0;
+            chunks.forEach(c => minZ = Math.min(minZ, c.position.z));
+
+            chunks.forEach(c => {
+                c.position.z += move;
+                
+                // Recycling Logic
+                // If chunk passes the ship (approx Z=6), recycle
+                if(c.position.z > 8) {
+                    c.position.z = minZ - CHUNK_SIZE;
+                    
+                    // Randomize contents
+                    for(let i=3; i<c.children.length; i++) {
+                        c.children[i].visible = Math.random() > 0.4;
+                    }
+                }
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+    </script>
+</body>
+</html>
