@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Quest 3 Trench Run</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: monospace;
+            color: white;
+        }
+        #info {
+            position: absolute;
+            top: 20px;
+            width: 100%;
+            text-align: center;
+            pointer-events: none;
+            z-index: 100;
+            text-shadow: 0 0 5px #00ffff;
+            font-size: 1.2rem;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        DEATH STAR TRENCH - MIXED REALITY<br>
+        <span style="font-size: 0.8em">Look slightly down. Trench slopes towards you.</span>
+    </div>
+
+    <!-- Import Map for Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let trenchGroup;
+        const trenchSegments = [];
+        
+        // Configuration
+        const SEGMENT_LENGTH = 10; // Depth of one chunk
+        const SEGMENT_COUNT = 8;   // How many chunks to keep active
+        const TRENCH_WIDTH = 4;
+        const TRENCH_WALL_HEIGHT = 2;
+        const SCROLL_SPEED = 8.0; 
+        const SLOPE_ANGLE = Math.PI / 6; // 30 degrees
+        
+        // Visual Style (Retro Wireframe)
+        const COLOR_FILL = 0x111111; // Dark grey to occlude real world slightly
+        const COLOR_LINE = 0x00FFFF; // Cyan wireframe
+        
+        // Shared Geometry/Materials to reduce draw calls
+        const lineMaterial = new THREE.LineBasicMaterial({ color: COLOR_LINE, linewidth: 2 });
+        const fillMaterial = new THREE.MeshBasicMaterial({ 
+            color: COLOR_FILL, 
+            polygonOffset: true, 
+            polygonOffsetFactor: 1, // Push back so lines render on top
+            polygonOffsetUnits: 1
+        });
+
+        init();
+        animate();
+
+        function init() {
+            // 1. Setup Scene
+            scene = new THREE.Scene();
+            // Important: Background must be null for Passthrough to work
+            scene.background = null; 
+
+            // 2. Setup Camera
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
+            
+            // 3. Setup Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. Setup Lighting (Simple ambient + directional for depth if we change materials later)
+            const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+            light.position.set(0.5, 1, 0.25);
+            scene.add(light);
+
+            // 5. Create Trench Container
+            // We place this slightly in front of the player (Z = -2) and down (Y = -0.5)
+            trenchGroup = new THREE.Group();
+            
+            // Angle: Sloping DOWN towards the player (30 degrees X rotation)
+            // Visually: The far end is higher than the near end.
+            trenchGroup.rotation.x = -SLOPE_ANGLE; 
+            trenchGroup.position.set(0, -0.5, -2);
+            
+            scene.add(trenchGroup);
+
+            // 6. Initialize Trench Segments
+            for (let i = 0; i < SEGMENT_COUNT; i++) {
+                // Position them starting from the player (0) extending outwards (-Z)
+                const zPos = -i * SEGMENT_LENGTH;
+                const segment = createTrenchSegment(zPos);
+                trenchSegments.push(segment);
+                trenchGroup.add(segment);
+            }
+
+            // 7. AR Button
+            const arButton = ARButton.createButton(renderer, { 
+                requiredFeatures: ['hit-test'], // Standard for AR
+                optionalFeatures: ['dom-overlay'],
+                domOverlay: { root: document.body }
+            });
+            document.body.appendChild(arButton);
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        // --- Generator Logic ---
+
+        function createStyledBox(w, h, d, x, y, z) {
+            const group = new THREE.Group();
+            group.position.set(x, y, z);
+
+            const geometry = new THREE.BoxGeometry(w, h, d);
+            const mesh = new THREE.Mesh(geometry, fillMaterial);
+            
+            // Create Edge Geometry for the wireframe look
+            const edges = new THREE.EdgesGeometry(geometry);
+            const line = new THREE.LineSegments(edges, lineMaterial);
+
+            group.add(mesh);
+            group.add(line);
+            
+            return group;
+        }
+
+        function createTrenchSegment(zPos) {
+            const segment = new THREE.Group();
+            segment.position.z = zPos;
+
+            // 1. Floor
+            segment.add(createStyledBox(TRENCH_WIDTH, 0.1, SEGMENT_LENGTH, 0, -0.05, 0));
+
+            // 2. Walls (Left and Right)
+            // Left Wall
+            segment.add(createStyledBox(0.5, TRENCH_WALL_HEIGHT, SEGMENT_LENGTH, -(TRENCH_WIDTH/2 + 0.25), TRENCH_WALL_HEIGHT/2, 0));
+            // Right Wall
+            segment.add(createStyledBox(0.5, TRENCH_WALL_HEIGHT, SEGMENT_LENGTH, (TRENCH_WIDTH/2 + 0.25), TRENCH_WALL_HEIGHT/2, 0));
+
+            // 3. Random Features (Obstacles/Greebles)
+            const numFeatures = Math.floor(Math.random() * 3) + 1;
+
+            for(let i=0; i<numFeatures; i++) {
+                const type = Math.random();
+                const localZ = (Math.random() - 0.5) * (SEGMENT_LENGTH * 0.8); // Spread within segment
+
+                if (type > 0.7) {
+                    // Bridge (High Horizontal)
+                    segment.add(createStyledBox(TRENCH_WIDTH, 0.2, 0.5, 0, TRENCH_WALL_HEIGHT * 0.8, localZ));
+                } else if (type > 0.4) {
+                    // Outcrop (Sticking out of wall)
+                    const isLeft = Math.random() > 0.5;
+                    const x = isLeft ? -(TRENCH_WIDTH/2 - 0.5) : (TRENCH_WIDTH/2 - 0.5);
+                    segment.add(createStyledBox(1, 0.5, 2, x, 0.5, localZ));
+                } else {
+                    // Base Feature / Turret (On Floor)
+                    const x = (Math.random() - 0.5) * (TRENCH_WIDTH - 1);
+                    segment.add(createStyledBox(0.8, 0.6, 0.8, x, 0.3, localZ));
+                }
+            }
+
+            return segment;
+        }
+
+        // --- Main Loop ---
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        const clock = new THREE.Clock();
+
+        function render() {
+            const delta = clock.getDelta();
+
+            // Move Segments
+            // In Three.js, -Z is forward/away from camera. 
+            // We want the trench to move TOWARDS the player (+Z relative to the trench group).
+            
+            // However, since we generated them into the screen (-Z), we move them +Z.
+            const moveDistance = SCROLL_SPEED * delta;
+
+            trenchSegments.forEach(segment => {
+                segment.position.z += moveDistance;
+
+                // Recycling Logic
+                // If the segment passes the "camera" (or a threshold), move it to the back
+                if (segment.position.z > SEGMENT_LENGTH) {
+                    // Find the furthest back Z position currently in the list
+                    // (Simple math: it moved forward by length, so we move it back by Count * Length)
+                    segment.position.z -= (SEGMENT_COUNT * SEGMENT_LENGTH);
+                    
+                    // Optional: Regenerate contents for variety (destroy children, rebuild)
+                    // For performance in this snippet, we keep geometry static, 
+                    // but in a full game you'd randomize obstacles here.
+                    
+                    // Let's do a quick randomize of position x of obstacles just to make it feel alive
+                    // segment.children[3]... are the obstacles (0=floor, 1=wall, 2=wall)
+                    for(let i=3; i<segment.children.length; i++) {
+                        if(segment.children[i]) {
+                             // Simple variety toggle
+                             segment.children[i].visible = Math.random() > 0.3;
+                        }
+                    }
+                }
+            });
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
