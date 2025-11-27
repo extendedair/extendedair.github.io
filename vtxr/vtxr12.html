@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Quest 3 Trench Run: Combat</title>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; }
+        #overlay {
+            position: absolute; top: 20px; left: 0; width: 100%;
+            text-align: center; color: #ffffff; font-family: 'Courier New', Courier, monospace;
+            font-weight: bold; text-shadow: 0 0 4px #000000; pointer-events: none;
+            z-index: 999;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">
+        // TRENCH RUN: COMBAT READY //<br>
+        <span style="font-size:0.8em">L-Stick: Fly | R-Trigger: Fire | 10&deg; Slope</span>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let trenchContainer, shipGroup;
+        const chunks = [];
+        let audioCtx;
+
+        // --- Configuration ---
+        const CHUNK_SIZE = 12;
+        const CHUNK_COUNT = 16;
+        const TRENCH_WIDTH = 8;
+        const TRENCH_HEIGHT = 6;
+        
+        // SPEED: Reduced by 25% (Old: 25.0 -> New: 18.75)
+        const SCROLL_SPEED = 18.75; 
+        
+        // ANGLE: 10 Degrees
+        const TILT_ANGLE = THREE.MathUtils.degToRad(10); 
+
+        // Ship Handling
+        // Pos: Moved 15% closer from -20.0 -> -17.0
+        const SHIP_Z_POS = -17.0; 
+        const SHIP_SPEED = 0.15; // Reduced by 25%
+        const SHIP_LIMIT_X = 3.2;
+        const SHIP_LIMIT_Y_MIN = 0.5;
+        const SHIP_LIMIT_Y_MAX = 5.5;
+
+        // Game State
+        const bullets = [];
+        const MAX_BULLETS = 6; // 3 pairs
+        const particles = [];
+        let isInvulnerable = false;
+        let respawnTimer = 0;
+        let fireCooldown = 0;
+
+        // --- Materials ---
+        const format = ( window.WebGL2RenderingContext ) ? THREE.RedFormat : THREE.LuminanceFormat;
+        const gradientMap = new THREE.DataTexture(new Uint8Array([60, 100, 140, 255]), 4, 1, format);
+        gradientMap.needsUpdate = true;
+        gradientMap.minFilter = THREE.NearestFilter;
+        gradientMap.magFilter = THREE.NearestFilter;
+
+        const matTrench = new THREE.MeshToonMaterial({ color: 0x555555, gradientMap: gradientMap });
+        const matFeature = new THREE.MeshToonMaterial({ color: 0x777777, gradientMap: gradientMap });
+        const matTall = new THREE.MeshToonMaterial({ color: 0x888899, gradientMap: gradientMap });
+        const matLine = new THREE.LineBasicMaterial({ color: 0xbbbbbb, linewidth: 1, opacity: 0.5, transparent: true });
+
+        const matShipBody = new THREE.MeshToonMaterial({ color: 0xeeeeee, gradientMap: gradientMap });
+        const matShipDetail = new THREE.MeshToonMaterial({ color: 0xcc0000, gradientMap: gradientMap });
+        const matEngine = new THREE.MeshBasicMaterial({ color: 0xffaa00 });
+        const matBullet = new THREE.MeshBasicMaterial({ color: 0x00ffff });
+        const matExplosion = new THREE.MeshBasicMaterial({ color: 0xffaa00 });
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = null; 
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 150);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+            dirLight.position.set(0, 20, 10); 
+            scene.add(dirLight);
+            scene.add(new THREE.AmbientLight(0x404040, 1.0));
+
+            // Setup World
+            trenchContainer = new THREE.Group();
+            // Y=-6 (High View), Z=-2
+            trenchContainer.position.set(0, -6.0, -2.0);
+            trenchContainer.rotation.x = TILT_ANGLE;
+            scene.add(trenchContainer);
+
+            // Chunks
+            for(let i=0; i<CHUNK_COUNT; i++) {
+                const z = -i * CHUNK_SIZE;
+                const chunk = createChunk(z);
+                chunks.push(chunk);
+                trenchContainer.add(chunk);
+            }
+
+            // Ship
+            shipGroup = createVoxelShip();
+            shipGroup.position.set(0, 2.0, SHIP_Z_POS); 
+            trenchContainer.add(shipGroup);
+
+            // Audio Setup (Lazy load on interaction)
+            const setupAudio = () => {
+                if(!audioCtx) {
+                    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                if(audioCtx.state === 'suspended') audioCtx.resume();
+            };
+            document.body.addEventListener('click', setupAudio);
+            document.body.addEventListener('touchstart', setupAudio);
+
+            // AR Button
+            const arBtn = ARButton.createButton(renderer, {
+                requiredFeatures: ['hit-test', 'local-floor'],
+                optionalFeatures: ['dom-overlay'],
+                domOverlay: { root: document.body }
+            });
+            arBtn.addEventListener('click', setupAudio); // Ensure audio starts on AR enter
+            document.body.appendChild(arBtn);
+
+            window.addEventListener('resize', onResize);
+        }
+
+        // --- Sound Generation ---
+        function playExplosionSound() {
+            if(!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            
+            // White noise buffer
+            const bufferSize = audioCtx.sampleRate * 0.5; // 0.5 seconds
+            const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0);
+            for (let i = 0; i < bufferSize; i++) {
+                data[i] = Math.random() * 2 - 1;
+            }
+
+            const noise = audioCtx.createBufferSource();
+            noise.buffer = buffer;
+            noise.connect(gain);
+            gain.connect(audioCtx.destination);
+
+            // Envelope
+            gain.gain.setValueAtTime(0.5, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+
+            noise.start();
+            noise.stop(audioCtx.currentTime + 0.3);
+        }
+
+        // --- Generators ---
+        function createVoxelShip() {
+            const ship = new THREE.Group();
+            const s = 0.15; 
+            const geo = new THREE.BoxGeometry(s,s,s);
+            const add = (x,y,z,mat) => {
+                const m = new THREE.Mesh(geo,mat);
+                m.position.set(x*s, y*s, z*s);
+                ship.add(m);
+            };
+            // Fuselage
+            for(let z=-4; z<=3; z++) add(0,0,z, matShipBody);
+            add(0,0,-5, matShipDetail); add(0,0.8,0, matShipDetail); 
+            // Wings
+            for(let i=1; i<=5; i++) {
+                add(-i, i*0.25, 1, matShipBody); add(i, i*0.25, 1, matShipBody);
+                add(-i, -i*0.25, 1, matShipBody); add(i, -i*0.25, 1, matShipBody);
+                if(i===5) { // Cannons
+                   add(-i, i*0.25, -1, matTrench); add(i, i*0.25, -1, matTrench);
+                   add(-i, -i*0.25, -1, matTrench); add(i, -i*0.25, -1, matTrench); 
+                }
+            }
+            // Engines
+            add(-1.5, 0.5, 2, matShipDetail); add(1.5, 0.5, 2, matShipDetail);
+            add(-1.5, -0.5, 2, matShipDetail); add(1.5, -0.5, 2, matShipDetail);
+            // Engine Glow
+            const glowGeo = new THREE.BoxGeometry(s*0.8, s*0.8, s*0.1);
+            const addGlow = (x,y) => {
+                const m = new THREE.Mesh(glowGeo, matEngine);
+                m.position.set(x*s, y*s, 2*s + 0.05);
+                ship.add(m);
+            };
+            addGlow(-1.5, 0.5); addGlow(1.5, 0.5); addGlow(-1.5, -0.5); addGlow(1.5, -0.5);
+
+            return ship;
+        }
+
+        function createCelMesh(geo, mat) {
+            const g = new THREE.Group();
+            const m = new THREE.Mesh(geo, mat);
+            g.add(m);
+            g.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), matLine));
+            g.userData.isObstacle = true; // Flag for collision
+            return g;
+        }
+
+        function createChunk(z) {
+            const g = new THREE.Group();
+            g.position.z = z;
+
+            // Floor (Not Obstacle)
+            const floor = new THREE.Mesh(new THREE.BoxGeometry(TRENCH_WIDTH, 1, CHUNK_SIZE), matTrench);
+            floor.position.y = -0.5;
+            const fEdges = new THREE.LineSegments(new THREE.EdgesGeometry(floor.geometry), matLine);
+            floor.add(fEdges);
+            g.add(floor);
+
+            // Walls (Not Obstacle for gameplay purposes, just bounds)
+            const wGeo = new THREE.BoxGeometry(1, TRENCH_HEIGHT, CHUNK_SIZE);
+            const lw = new THREE.Mesh(wGeo, matTrench);
+            lw.position.set(-(TRENCH_WIDTH/2 + 0.5), TRENCH_HEIGHT/2 - 0.5, 0);
+            lw.add(new THREE.LineSegments(new THREE.EdgesGeometry(wGeo), matLine));
+            g.add(lw);
+            
+            const rw = new THREE.Mesh(wGeo, matTrench);
+            rw.position.set((TRENCH_WIDTH/2 + 0.5), TRENCH_HEIGHT/2 - 0.5, 0);
+            rw.add(new THREE.LineSegments(new THREE.EdgesGeometry(wGeo), matLine));
+            g.add(rw);
+
+            // Features (Obstacles)
+            // Spawn multiple per chunk for density
+            for(let k=0; k<3; k++) {
+                if(Math.random() > 0.4) {
+                    const type = Math.random();
+                    const lz = (Math.random()-0.5)*(CHUNK_SIZE*0.9);
+                    
+                    if(type < 0.25) { // Bridge
+                        const h = Math.random() * 2.0 + 2.5;
+                        const b = createCelMesh(new THREE.BoxGeometry(TRENCH_WIDTH, 0.5, 1), matFeature);
+                        b.position.set(0, h, lz);
+                        g.add(b);
+                    } 
+                    else if(type < 0.5) { // Turret
+                        const t = createCelMesh(new THREE.BoxGeometry(1.2,1,1.2), matFeature);
+                        t.position.set((Math.random()-0.5)*(TRENCH_WIDTH-2), 0.5, lz);
+                        g.add(t);
+                    } 
+                    else if(type < 0.75) { // Tall Block
+                        const h = 2 + Math.random();
+                        const t = createCelMesh(new THREE.BoxGeometry(1.2, h, 1.2), matTall);
+                        const xPos = (Math.random() > 0.5 ? 1 : -1) * (Math.random() * 1.5 + 1);
+                        t.position.set(xPos, h/2, lz);
+                        g.add(t);
+                    }
+                    else { // Pipe
+                        const p = createCelMesh(new THREE.CylinderGeometry(0.4,0.4,1.5, 8), matFeature);
+                        p.rotation.z = Math.PI/2;
+                        const s = Math.random()>0.5?1:-1;
+                        p.position.set(s*(TRENCH_WIDTH/2 - 0.5), 2.5, lz);
+                        g.add(p);
+                    }
+                }
+            }
+            return g;
+        }
+
+        // --- Bullets & Particles ---
+        
+        function fire() {
+            if(fireCooldown > 0 || bullets.length >= MAX_BULLETS) return;
+            fireCooldown = 0.2; // rate limit
+
+            const createB = (offsetX) => {
+                const b = new THREE.Mesh(new THREE.SphereGeometry(0.15), matBullet);
+                // Position relative to trench container
+                b.position.copy(shipGroup.position);
+                b.position.x += offsetX;
+                b.position.y += 0.25; // Wing height offset
+                b.position.z -= 1.0;  // Slightly ahead
+                trenchContainer.add(b);
+                bullets.push(b);
+            };
+            // Left and Right wing
+            createB(-1.2);
+            createB(1.2);
+        }
+
+        function createExplosion(pos) {
+            playExplosionSound();
+            for(let i=0; i<8; i++) {
+                const p = new THREE.Mesh(new THREE.BoxGeometry(0.2,0.2,0.2), matExplosion);
+                p.position.copy(pos);
+                // Random velocity
+                p.userData.vel = new THREE.Vector3(
+                    (Math.random()-0.5), (Math.random()-0.5), (Math.random()-0.5)
+                ).normalize().multiplyScalar(Math.random()*5);
+                p.userData.life = 1.0;
+                trenchContainer.add(p);
+                particles.push(p);
+            }
+        }
+
+        function handleCollision() {
+            if(isInvulnerable) return;
+            
+            createExplosion(shipGroup.position);
+            
+            isInvulnerable = true;
+            respawnTimer = 2.0;
+        }
+
+        // --- Main Logic ---
+
+        function handleInput(dt) {
+            if(fireCooldown > 0) fireCooldown -= dt;
+
+            const session = renderer.xr.getSession();
+            if(!session) return;
+            
+            for(const src of session.inputSources) {
+                if(src.gamepad) {
+                    // Flight (Left Stick)
+                    if(src.handedness === 'left' && src.gamepad.axes.length >= 4) {
+                        const x = src.gamepad.axes[2];
+                        const y = src.gamepad.axes[3];
+                        
+                        shipGroup.position.x += x * SHIP_SPEED;
+                        shipGroup.position.y -= y * SHIP_SPEED;
+                        
+                        shipGroup.rotation.z = -x * 0.4; 
+                        shipGroup.rotation.x = y * 0.2;
+
+                        shipGroup.position.x = Math.max(-SHIP_LIMIT_X, Math.min(SHIP_LIMIT_X, shipGroup.position.x));
+                        shipGroup.position.y = Math.max(SHIP_LIMIT_Y_MIN, Math.min(SHIP_LIMIT_Y_MAX, shipGroup.position.y));
+                    }
+                    // Fire (Right Trigger/A or Left Trigger) - Check buttons 0 (Trigger) or 4 (A/X)
+                    // Just check all triggers for simplicity
+                    if(src.gamepad.buttons[0]?.pressed || src.gamepad.buttons[4]?.pressed) {
+                        fire();
+                    }
+                }
+            }
+        }
+
+        // Reuse Box3 for GC efficiency
+        const shipBox = new THREE.Box3();
+        const obsBox = new THREE.Box3();
+
+        function checkCollisions() {
+            if(isInvulnerable) return;
+
+            // Update Ship Box (World Space)
+            shipBox.setFromObject(shipGroup);
+            // Shrink slightly to be forgiving
+            shipBox.expandByScalar(-0.1); 
+
+            // Check against features
+            // Optimization: Only check chunks near the ship (-17 z)
+            // Chunks move +Z. 
+            for(const chunk of chunks) {
+                // If chunk is reasonably close to ship Z (-17)
+                if(Math.abs(chunk.position.z - SHIP_Z_POS) < CHUNK_SIZE) {
+                    for(const child of chunk.children) {
+                        if(child.userData.isObstacle && child.visible) {
+                            obsBox.setFromObject(child);
+                            if(shipBox.intersectsBox(obsBox)) {
+                                handleCollision();
+                                return; // Only one collision per frame
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        function updateEntities(dt) {
+            // Respawn Flash
+            if(isInvulnerable) {
+                respawnTimer -= dt;
+                if(respawnTimer <= 0) {
+                    isInvulnerable = false;
+                    shipGroup.visible = true;
+                } else {
+                    // Flash every 0.1s
+                    shipGroup.visible = Math.floor(respawnTimer * 10) % 2 === 0;
+                }
+            }
+
+            // Bullets
+            for(let i=bullets.length-1; i>=0; i--) {
+                const b = bullets[i];
+                b.position.z -= 40 * dt; // Move fast away from player
+                // Despawn if too far
+                if(b.position.z < -60) {
+                    trenchContainer.remove(b);
+                    bullets.splice(i, 1);
+                }
+                // Optional: Check bullet collision with obstacles could go here
+            }
+
+            // Particles
+            for(let i=particles.length-1; i>=0; i--) {
+                const p = particles[i];
+                p.position.addScaledVector(p.userData.vel, dt);
+                p.userData.life -= dt;
+                p.scale.multiplyScalar(0.9); // Shrink
+                if(p.userData.life <= 0) {
+                    trenchContainer.remove(p);
+                    particles.splice(i, 1);
+                }
+            }
+        }
+
+        function onResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        const clock = new THREE.Clock();
+
+        function render() {
+            const dt = clock.getDelta();
+            
+            handleInput(dt);
+            checkCollisions();
+            updateEntities(dt);
+
+            // Scroll Chunks
+            const move = SCROLL_SPEED * dt;
+            let minZ = 0;
+            chunks.forEach(c => minZ = Math.min(minZ, c.position.z));
+
+            chunks.forEach(c => {
+                c.position.z += move;
+                // Recycle
+                if(c.position.z > 8) {
+                    c.position.z = minZ - CHUNK_SIZE;
+                    for(let i=3; i<c.children.length; i++) {
+                        c.children[i].visible = Math.random() > 0.3;
+                    }
+                }
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+    </script>
+</body>
+</html>
