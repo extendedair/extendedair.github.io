@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Quest 3 Trench Run: Voxel Edition</title>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; }
+        #overlay {
+            position: absolute; top: 20px; left: 0; width: 100%;
+            text-align: center; color: #00ff00; font-family: 'Courier New', Courier, monospace;
+            font-weight: bold; text-shadow: 0 0 5px #00ff00; pointer-events: none;
+            z-index: 999;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">
+        VOXEL TRENCH RUN<br>
+        <span style="font-size:0.8em">Left Thumbstick to Fly</span>
+    </div>
+
+    <!-- Import Map -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        let camera, scene, renderer;
+        let trenchContainer, shipGroup;
+        const chunks = [];
+        
+        // --- Settings ---
+        const CHUNK_SIZE = 12;
+        const CHUNK_COUNT = 12;
+        const TRENCH_WIDTH = 8;
+        const TRENCH_HEIGHT = 5;
+        const SCROLL_SPEED = 15.0;
+        const TILT_ANGLE = Math.PI / 6; // 30 Degrees
+        
+        // Ship movement limits (Local to trench)
+        const SHIP_LIMIT_X = 3.5;
+        const SHIP_LIMIT_Y_MIN = 0.5;
+        const SHIP_LIMIT_Y_MAX = 4.0;
+        const SHIP_SPEED = 0.1;
+
+        // --- Cel Shading Materials ---
+        const format = ( window.WebGL2RenderingContext ) ? THREE.RedFormat : THREE.LuminanceFormat;
+        const gradientColors = new Uint8Array([50, 100, 180, 255]); // 4 discrete bands
+        const gradientMap = new THREE.DataTexture(gradientColors, 4, 1, format);
+        gradientMap.needsUpdate = true;
+        gradientMap.minFilter = THREE.NearestFilter;
+        gradientMap.magFilter = THREE.NearestFilter;
+
+        const matGrey = new THREE.MeshToonMaterial({ color: 0x333333, gradientMap: gradientMap });
+        const matFeature = new THREE.MeshToonMaterial({ color: 0x555555, gradientMap: gradientMap });
+        const matShipWhite = new THREE.MeshToonMaterial({ color: 0xeeeeee, gradientMap: gradientMap });
+        const matShipRed = new THREE.MeshToonMaterial({ color: 0xff0000, gradientMap: gradientMap });
+        const matEngine = new THREE.MeshBasicMaterial({ color: 0xffaa00 });
+        const lineMat = new THREE.LineBasicMaterial({ color: 0x00ff00, linewidth: 2 }); // Green retro lines
+
+        init();
+        animate();
+
+        function init() {
+            // 1. Scene & Camera
+            scene = new THREE.Scene();
+            scene.background = null; // Transparent for Passthrough
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
+
+            // 2. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 3. Lighting
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+            dirLight.position.set(5, 10, 5);
+            scene.add(dirLight);
+            const ambLight = new THREE.AmbientLight(0x404040, 0.6);
+            scene.add(ambLight);
+
+            // 4. World Container
+            // We place this down and forward relative to the player
+            trenchContainer = new THREE.Group();
+            trenchContainer.position.set(0, -1.0, -1.5);
+            
+            // TILT: Rotate X negative so the "Far" end (-Z) goes UP.
+            // This creates a slope down towards the player.
+            trenchContainer.rotation.x = -TILT_ANGLE; 
+            scene.add(trenchContainer);
+
+            // 5. Generate Initial Trench Chunks
+            for (let i = 0; i < CHUNK_COUNT; i++) {
+                // We spawn them starting from "Far" (-Z) coming to "Near" (+Z) or vice versa.
+                // Standard: -Z is forward. We want them to scroll towards +Z.
+                // Let's spawn them deep into the screen.
+                const zPos = -i * CHUNK_SIZE;
+                const chunk = createChunk(zPos);
+                chunks.push(chunk);
+                trenchContainer.add(chunk);
+            }
+
+            // 6. Create Voxel Ship
+            shipGroup = createVoxelShip();
+            // Position ship "near" the player within the trench coordinate system
+            // High Z is closer to player in this rotated group
+            shipGroup.position.set(0, 2, 2); 
+            trenchContainer.add(shipGroup);
+
+            // 7. AR Button
+            const arBtn = ARButton.createButton(renderer, { 
+                requiredFeatures: ['hit-test', 'local-floor'],
+                optionalFeatures: ['dom-overlay'],
+                domOverlay: { root: document.body }
+            });
+            document.body.appendChild(arBtn);
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+        }
+
+        // --- Voxel Ship Generator ---
+        function createVoxelShip() {
+            const ship = new THREE.Group();
+            const voxelSize = 0.15;
+            const geo = new THREE.BoxGeometry(voxelSize, voxelSize, voxelSize);
+
+            function addVoxel(x, y, z, mat) {
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.position.set(x * voxelSize, y * voxelSize, z * voxelSize);
+                ship.add(mesh);
+            }
+
+            // Simple X-Wing Voxel Structure
+            // Fuselage (Length z: -3 to 3)
+            for(let z=-3; z<=3; z++) addVoxel(0, 0, z, matShipWhite);
+            
+            // Nose
+            addVoxel(0, 0, -4, matShipRed);
+
+            // Wings (X Shape)
+            for(let i=1; i<=4; i++) {
+                // Top Left
+                addVoxel(-i, i*0.3, 1, matShipWhite);
+                addVoxel(-i, i*0.3, 0, matShipWhite);
+                // Top Right
+                addVoxel(i, i*0.3, 1, matShipWhite);
+                addVoxel(i, i*0.3, 0, matShipWhite);
+                // Bottom Left
+                addVoxel(-i, -i*0.3, 1, matShipWhite);
+                addVoxel(-i, -i*0.3, 0, matShipWhite);
+                // Bottom Right
+                addVoxel(i, -i*0.3, 1, matShipWhite);
+                addVoxel(i, -i*0.3, 0, matShipWhite);
+            }
+
+            // Engines (Red markings)
+            addVoxel(-2, 0.6, 2, matShipRed);
+            addVoxel(2, 0.6, 2, matShipRed);
+            addVoxel(-2, -0.6, 2, matShipRed);
+            addVoxel(2, -0.6, 2, matShipRed);
+
+            // Engine Glow
+            const glowGeo = new THREE.BoxGeometry(voxelSize*0.8, voxelSize*0.8, voxelSize*0.1);
+            const createEngine = (x,y,z) => {
+                const m = new THREE.Mesh(glowGeo, matEngine);
+                m.position.set(x*voxelSize, y*voxelSize, z*voxelSize + 0.1);
+                ship.add(m);
+            };
+            createEngine(-2, 0.6, 2); createEngine(2, 0.6, 2);
+            createEngine(-2, -0.6, 2); createEngine(2, -0.6, 2);
+
+            // Scale up slightly
+            ship.scale.set(1.5, 1.5, 1.5);
+            
+            // Add a point light to the ship so it lights up the trench as it passes
+            const shipLight = new THREE.PointLight(0xffaa00, 1, 5);
+            shipLight.position.set(0, 0, 1);
+            ship.add(shipLight);
+
+            return ship;
+        }
+
+        // --- Trench Logic ---
+        function createCelMesh(geometry, material) {
+            const group = new THREE.Group();
+            const mesh = new THREE.Mesh(geometry, material);
+            group.add(mesh);
+            const edges = new THREE.EdgesGeometry(geometry);
+            const line = new THREE.LineSegments(edges, lineMat);
+            group.add(line);
+            return group;
+        }
+
+        function createChunk(zPos) {
+            const group = new THREE.Group();
+            group.position.z = zPos;
+
+            // Floor
+            const floor = createCelMesh(new THREE.BoxGeometry(TRENCH_WIDTH, 1, CHUNK_SIZE), matGrey);
+            floor.position.y = -0.5;
+            group.add(floor);
+
+            // Left Wall
+            const lWall = createCelMesh(new THREE.BoxGeometry(1, TRENCH_HEIGHT, CHUNK_SIZE), matGrey);
+            lWall.position.set(-(TRENCH_WIDTH/2 + 0.5), TRENCH_HEIGHT/2 - 1, 0);
+            group.add(lWall);
+
+            // Right Wall
+            const rWall = createCelMesh(new THREE.BoxGeometry(1, TRENCH_HEIGHT, CHUNK_SIZE), matGrey);
+            rWall.position.set((TRENCH_WIDTH/2 + 0.5), TRENCH_HEIGHT/2 - 1, 0);
+            group.add(rWall);
+
+            // Greebles / Obstacles
+            const type = Math.random();
+            const localZ = (Math.random() - 0.5) * (CHUNK_SIZE * 0.6);
+
+            if (type < 0.2) {
+                // Bridge
+                const bridge = createCelMesh(new THREE.BoxGeometry(TRENCH_WIDTH, 0.5, 1), matFeature);
+                bridge.position.set(0, 3, localZ);
+                group.add(bridge);
+            } else if (type < 0.5) {
+                // Turret Base
+                const turret = createCelMesh(new THREE.BoxGeometry(1, 1, 1), matFeature);
+                const tX = (Math.random() - 0.5) * (TRENCH_WIDTH - 2);
+                turret.position.set(tX, 0.5, localZ);
+                group.add(turret);
+            } else if (type < 0.7) {
+                // Wall Pipes
+                const pipe = createCelMesh(new THREE.CylinderGeometry(0.4, 0.4, 2, 8), matFeature);
+                pipe.rotation.z = Math.PI / 2;
+                const side = Math.random() > 0.5 ? 1 : -1;
+                pipe.position.set(side * (TRENCH_WIDTH/2 - 1), 2, localZ);
+                group.add(pipe);
+            }
+
+            return group;
+        }
+
+        function handleInput() {
+            const session = renderer.xr.getSession();
+            if (!session) return;
+
+            let inputVector = { x: 0, y: 0 };
+
+            // Scan input sources for left gamepad
+            for (const source of session.inputSources) {
+                if (source.handedness === 'left' && source.gamepad) {
+                    // Standard Gamepad mapping: axes[2] = X, axes[3] = Y
+                    // (Ensure gamepad is not null)
+                    const gp = source.gamepad;
+                    if (gp.axes.length >= 4) {
+                        inputVector.x = gp.axes[2];
+                        inputVector.y = gp.axes[3];
+                    }
+                }
+            }
+
+            // Apply movement
+            if (shipGroup) {
+                shipGroup.position.x -= inputVector.x * SHIP_SPEED;
+                shipGroup.position.y -= inputVector.y * SHIP_SPEED;
+
+                // Bank rotation for effect
+                shipGroup.rotation.z = inputVector.x * 0.5; // Roll
+                shipGroup.rotation.x = inputVector.y * 0.3; // Pitch
+
+                // Clamp
+                shipGroup.position.x = Math.max(-SHIP_LIMIT_X, Math.min(SHIP_LIMIT_X, shipGroup.position.x));
+                shipGroup.position.y = Math.max(SHIP_LIMIT_Y_MIN, Math.min(SHIP_LIMIT_Y_MAX, shipGroup.position.y));
+            }
+        }
+
+        const clock = new THREE.Clock();
+
+        function render() {
+            const dt = clock.getDelta();
+
+            // 1. Process Input
+            handleInput();
+
+            // 2. Scroll Logic
+            // We move chunks +Z (towards player)
+            const moveDist = SCROLL_SPEED * dt;
+            
+            chunks.forEach(chunk => {
+                chunk.position.z += moveDist;
+
+                // If chunk passes the recycling point (behind player/camera relative to trench)
+                if (chunk.position.z > (CHUNK_SIZE * 2)) {
+                     // Move to back
+                     // Find the lowest Z
+                     let minZ = 99999;
+                     chunks.forEach(c => minZ = Math.min(minZ, c.position.z));
+                     chunk.position.z = minZ - CHUNK_SIZE;
+                     
+                     // Randomize visibility of obstacles (children index > 3)
+                     for(let i=3; i<chunk.children.length; i++) {
+                         chunk.children[i].visible = Math.random() > 0.3;
+                     }
+                }
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+    </script>
+</body>
+</html>
